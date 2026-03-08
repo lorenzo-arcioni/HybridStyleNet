@@ -1,0 +1,18 @@
+1) puoi usare MobileNetV3-Small
+2)Procedi con Reptile
+3) usare un subset fisso di K=20
+4) Non fare nulla
+5) usare VGG16 invece di VGG19; usare solo 2 layer invece di 4
+6) USa 4 teste
+7) ridurre a 16×16×8 come compromesso tra local e global e ridurre i canali SPADE da 256 a 128.
+
+[in tutto il documento usa fp16 mixed precision]
+
+Q: Per la risoluzione di training, cosa preferisci?
+A: 512×384 (più sicuro, batch 4-6)
+
+Q: Per il batch size durante il meta-training Reptile, cosa preferisci?
+A: M=2 task per batch (più sicuro)
+
+Q: Gradient checkpointing sull'encoder?
+A: Sì (meno memoria, +30% tempo)

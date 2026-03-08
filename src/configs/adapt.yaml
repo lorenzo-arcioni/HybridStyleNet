@@ -1,0 +1,115 @@
+# ============================================================
+#  adapt.yaml — Fase 3: Few-shot adaptation al fotografo target
+#  Esegue override su default.yaml
+# ============================================================
+
+# ── Override percorsi ────────────────────────────────────────
+paths:
+  checkpoints_dir: "checkpoints/adapt"
+  logs_dir:        "logs/adapt"
+
+# ── Checkpoint di partenza (theta_meta) ─────────────────────
+meta:
+  checkpoint: "checkpoints/meta/best.pth"
+
+# ── Dataset fotografo target ─────────────────────────────────
+data:
+  custom_root:       "data/custom"   # Cartella con src/ e tgt/
+  val_split:         0.2             # 20% holdout per early stopping
+  min_pairs:         50
+  max_pairs:         200
+  # Formati RAW accettati
+  raw_extensions:    [".arw", ".dng", ".ARW", ".DNG"]
+  tgt_extensions:    [".jpg", ".jpeg", ".JPG", ".JPEG",
+                      ".tif", ".tiff", ".TIF", ".TIFF"]
+
+# ── Fase 3A: freeze-then-train (epoche 1-10) ─────────────────
+phase_a:
+  epochs:        10
+  lr:            5.0e-5
+  weight_decay:  2.0e-3
+  batch_size:    4
+  # Parametri congelati
+  frozen_stages: [1, 2]             # CNN stage 1-2 + Swin stage 4
+  freeze_swin4:  true
+
+  # Loss curriculum (colonne 1-5 poi 6-10, sezione 6.6)
+  loss_curriculum:
+    epochs_1_5:
+      lambda_delta_e:  0.6
+      lambda_hist:     0.4
+      lambda_perc:     0.0
+      lambda_style:    0.0
+      lambda_cos:      0.0
+      lambda_chroma:   0.0
+      lambda_id:       0.5
+    epochs_6_10:
+      lambda_delta_e:  0.5
+      lambda_hist:     0.3
+      lambda_perc:     0.2
+      lambda_style:    0.1
+      lambda_cos:      0.0
+      lambda_chroma:   0.1
+      lambda_id:       0.5
+
+# ── Fase 3B: fine-tuning globale (epoche 11-30) ──────────────
+phase_b:
+  epochs:        20               # Totale: epoche 11-30
+  lr:            2.5e-5
+  weight_decay:  2.0e-3
+  batch_size:    4
+
+  # Cosine annealing
+  scheduler:
+    type:     "cosine"
+    t_max:    20                  # Epoche della fase B
+    eta_min:  1.0e-6
+
+  # Loss curriculum (colonne 11-20, poi stabile)
+  loss_curriculum:
+    epochs_11_20:
+      lambda_delta_e:  0.5
+      lambda_hist:     0.3
+      lambda_perc:     0.4
+      lambda_style:    0.2
+      lambda_cos:      0.15
+      lambda_chroma:   0.2
+      lambda_id:       0.5
+    epochs_21_plus:
+      lambda_delta_e:  0.5
+      lambda_hist:     0.3
+      lambda_perc:     0.4
+      lambda_style:    0.2
+      lambda_cos:      0.15
+      lambda_chroma:   0.2
+      lambda_id:       0.5
+
+  # Consistency loss (attivata solo nella fase B)
+  consistency_loss:
+    enabled:   true
+    weight:    0.1
+    threshold: 0.7
+
+# ── Early stopping ───────────────────────────────────────────
+early_stopping:
+  patience:  5                   # p: epoche senza miglioramento
+  monitor:   "val_delta_e"       # Metrica monitorata
+  mode:      "min"
+
+# ── Data augmentation ────────────────────────────────────────
+augmentation:
+  horizontal_flip_prob: 0.5
+  random_crop_scale:    [0.7, 1.0]
+  rotation_degrees:     5.0
+  exposure_perturb:
+    enabled: true
+    prob:    0.3
+    range:   [0.9, 1.1]
+  noise_perturb:
+    enabled: true
+    prob:    0.3
+    sigma:   0.01
+
+# ── Override hardware ────────────────────────────────────────
+hardware:
+  amp: true

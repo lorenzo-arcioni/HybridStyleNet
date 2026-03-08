@@ -1,0 +1,70 @@
+# ============================================================
+#  meta_train.yaml — Fase 2: Meta-training MAML
+#  Esegue override su default.yaml
+# ============================================================
+
+# ── Override percorsi ────────────────────────────────────────
+paths:
+  checkpoints_dir: "checkpoints/meta"
+  logs_dir:        "logs/meta"
+
+# ── Fase 1 checkpoint di partenza ───────────────────────────
+pretrain:
+  checkpoint: "checkpoints/pretrain/best.pth"
+
+# ── Dataset FiveK per meta-training ─────────────────────────
+data:
+  # Divisione fotografi
+  meta_train_experts: ["A", "B", "C"]   # Task reali
+  meta_val_expert:    "D"
+  meta_test_expert:   "E"
+
+  # Numero coppie per expert usate nel meta-training
+  pairs_per_expert: 1000
+
+  # Support / Query split per ogni task
+  support_size: 15     # K_s
+  query_size:   5      # K_q
+
+# ── MAML iperparametri ───────────────────────────────────────
+maml:
+  inner_lr:        1.0e-3       # α — inner loop learning rate
+  meta_lr:         5.0e-5       # β — outer loop (meta) learning rate
+  inner_steps:     5            # T_inner
+  tasks_per_batch: 3            # M — task campionati per meta-update
+  meta_iterations: 10000        # Numero totale di iterazioni meta
+  first_order:     false        # Se true usa FOMAML (no 2nd order grads)
+
+# ── Task Augmentation ────────────────────────────────────────
+task_augmentation:
+  enabled:          true
+  synthetic_prob:   0.5         # Prob. di campionare task sintetico
+  lambda_min:       0.1         # Estremo inferiore interpolazione
+  lambda_max:       0.9         # Estremo superiore interpolazione
+  # Tutte le coppie di fotografi disponibili vengono usate (C(n,2))
+
+# ── Scheduler meta-training ──────────────────────────────────
+scheduler:
+  type:      "cosine"
+  warmup_steps: 200
+  min_lr:    1.0e-6
+
+# ── Override loss (curriculum fase 6-10, sezione 6.6) ────────
+loss:
+  lambda_delta_e:  0.5
+  lambda_hist:     0.3
+  lambda_perc:     0.2
+  lambda_style:    0.1
+  lambda_cos:      0.0
+  lambda_chroma:   0.1
+  lambda_id:       0.5
+
+# ── Override hardware ────────────────────────────────────────
+hardware:
+  amp: true
+
+# ── Logging ──────────────────────────────────────────────────
+logging:
+  log_every_n_steps:     50
+  save_every_n_epochs:   500    # Salva ogni 500 iterazioni meta
+  keep_last_n_checkpoints: 5
