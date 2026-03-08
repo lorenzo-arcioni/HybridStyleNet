@@ -35,7 +35,7 @@ Successivamente interviene il color grading, che costituisce la fase creativa de
 Attraverso quest ultima operazione, i fotografi sviluppano workflow di editing personalizzati che contribuiscono alla creazione di una “firma visiva” riconoscibile, caratteristica che rende il processo di grading una componente fondamentale della fotografia contemporanea. Questo processo è spesso:
 
 - **Ripetitivo**: Centinaia/migliaia di foto per progetto
-- **Time-consuming**: 2-5 minuti per foto ad alta qualità
+- **Time-consuming**: 5-10 minuti a foto, per foto ad alta qualità
 - **Non scalabile**: Limita il throughput del fotografo
 - **Altamente personalizzato**: Ogni fotografo ha uno stile unico e riconoscibile
 
@@ -103,7 +103,7 @@ dove $\mathcal{L}$ è la Color-Aesthetic Loss composita definita nella sezione 6
 1. **Few-shot regime**: $N \ll 1000$ (tipicamente 100–200 coppie)
 2. **Preservazione struttura**: $\text{SSIM}(I^{src}, I^{pred}) > 0.99$
 3. **Accuratezza cromatica**: $\Delta E_{00}(I^{pred}, I^{tgt}) < 5$ (media su tutti i pixel)
-4. **Latenza inferenza**: $< 10\,\text{s}$ per immagine a risoluzione piena su GPU consumer
+4. **Latenza inferenza**: $< 10\,\text{s}$ per immagine a risoluzione piena su CPU consumer
 5. **Invarianza alla risoluzione**: $f_\theta$ deve funzionare su qualsiasi $(H, W)$ senza riaddestrare né modificare l'architettura — implicazione diretta dell'uso di coordinate normalizzate e global average pooling
 6. **End-to-end**: nessun parametro di editing esplicito (esposizione, curve, HSL, ecc.) — la rete apprende la trasformazione completa $\mathbf{R} \to I^{pred}$ come mapping implicito
 
