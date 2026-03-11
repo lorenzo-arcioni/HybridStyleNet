@@ -130,11 +130,11 @@ Input: I^src ∈ [0,1]^{H×W×3}  (risoluzione variabile)
 
 ##### **1. CNN Stem: MobileNetV3-Small Stage 1-3**
 
-MobileNetV3-Small è scelto come encoder leggero per tre ragioni fondamentali nel contesto few-shot e del budget computazionale su GPU consumer. In primo luogo i **blocchi depthwise separable con SE**: ogni blocco applica una convoluzione depthwise separable seguita da un modulo Squeeze-and-Excitation con funzione di attivazione Hard-Swish, catturando relazioni inter-canale cromatiche fondamentali per il color grading con un numero di parametri nettamente inferiore a EfficientNet-B4. In secondo luogo la **leggerezza del modello**: MobileNetV3-Small ha circa 2.5M di parametri contro i 19M di EfficientNet-B4, riducendo il rischio di overfitting nel regime few-shot e il consumo di memoria con **fp16 mixed precision** su RTX 3080. In terzo luogo il **pre-training ImageNet**: il modello sa già riconoscere semanticamente la scena prima del training sul fotografo — cruciale nel regime few-shot dove non ci sono abbastanza coppie per imparare tali rappresentazioni da zero.
+MobileNetV3-Small è scelto come encoder leggero per tre ragioni fondamentali nel contesto few-shot e del budget computazionale su GPU consumer. In primo luogo i **blocchi depthwise separable con SE (Squeeze-and-Excitation)**: ogni blocco applica una convoluzione depthwise separable seguita da un modulo Squeeze-and-Excitation con funzione di attivazione Hard-Swish, catturando relazioni inter-canale cromatiche fondamentali per il color grading con un numero di parametri nettamente inferiore a EfficientNet-B4. In secondo luogo la **leggerezza del modello**: MobileNetV3-Small ha circa 2.5M di parametri contro i 19M di EfficientNet-B4, riducendo il rischio di overfitting nel regime few-shot e il consumo di memoria con **fp16 mixed precision** su RTX 3080. In terzo luogo il **pre-training ImageNet**: il modello sa già riconoscere semanticamente la scena prima del training sul fotografo — cruciale nel regime few-shot dove non ci sono abbastanza coppie per imparare tali rappresentazioni da zero.
 
-La trasformazione matematica dei tre stage è la seguente. Sia $I_{src} \in [0,1]^{H \times W \times 3}$ con $(H, W)$ arbitrari. Il CNN stem applica una sequenza di blocchi Bottleneck Inverted Residual (bneck) $\mathcal{F}^{(k)}$ con stride 2 ad ogni stage:
+La trasformazione matematica dei tre stage è la seguente. Sia $I_{src} \in [0,1]^{H \times W \times 3}$ con $(H, W)$ arbitrari. Il CNN stem applica una sequenza di blocchi Bottleneck Inverted Residual (bneck) $\mathcal{F}^{(k)}$, con stride 2 nella conv iniziale e in ogni primo blocco di ciascuno stage, per uno stride complessivo di $2^4 = 16$:
 
-$$P_3 = \mathcal{F}^{(3)}\!\left(\mathcal{F}^{(2)}\!\left(\mathcal{F}^{(1)}(I_{src})\right)\right) \in \mathbb{R}^{B \times 48 \times H_3 \times W_3}$$
+$$P_3 = \mathcal{F}^{(3)}\!\left(\mathcal{F}^{(2)}\!\left(\mathcal{F}^{(1)}(I_{src})\right)\right) \in \mathbb{R}^{48 \times H/16 \times W/16}$$
 
 **Blocco bneck con SE e Hard-Swish.** Sia $\mathbf{x} \in \mathbb{R}^{C_{in} \times H' \times W'}$ l'input al blocco con expansion ratio $e$ (tipicamente $e = 4$–$6$ in MobileNetV3-Small). Il blocco è:
 
@@ -150,9 +150,9 @@ Il modulo **Squeeze-and-Excitation** su $\mathbf{x}_{dw}$:
 
 $$\mathbf{z} = \frac{1}{H'W'}\sum_{i,j}\mathbf{x}_{dw}(\cdot,i,j) \in \mathbb{R}^{eC_{in}} \quad \text{(squeeze: global average pool)}$$
 
-$$\mathbf{e} = \sigma\!\left(\mathbf{W}_2\,\delta_{re}(\mathbf{W}_1\,\mathbf{z})\right) \in (0,1)^{eC_{in}}, \quad \mathbf{W}_1 \in \mathbb{R}^{\lfloor eC_{in}/4\rfloor \times eC_{in}},\ \mathbf{W}_2 \in \mathbb{R}^{eC_{in} \times \lfloor eC_{in}/4\rfloor}$$
+$$\mathbf{e} = \text{hardsigmoid}\!\left(\mathbf{W}_2\,\delta_{re}(\mathbf{W}_1\,\mathbf{z})\right) \in (0,1)^{eC_{in}}, \quad \mathbf{W}_1 \in \mathbb{R}^{\lfloor eC_{in}/4\rfloor \times eC_{in}},\ \mathbf{W}_2 \in \mathbb{R}^{eC_{in} \times \lfloor eC_{in}/4\rfloor}$$
 
-con reduction ratio $r = 4$. Il **excitation** ri-pondera i canali:
+con reduction ratio $r = 4$ e $\text{hardsigmoid}(x) = \min(\max(x+3, 0), 6)/6$. Il **excitation** ri-pondera i canali:
 
 $$\mathbf{x}_{se} = \mathbf{e} \odot \mathbf{x}_{dw}$$
 
@@ -164,7 +164,7 @@ $$\mathcal{F}^{(k)}(\mathbf{x}) = \begin{cases} \mathbf{x} + \mathbf{x}_{proj} &
 
 Le funzioni di attivazione sono: **Hard-Swish** $\delta_{hs}(x) = x \cdot \text{ReLU6}(x+3)/6$ nei layer più profondi, e **ReLU** $\delta_{re}(x) = \max(0,x)$ nel modulo SE interno — esattamente come specificato nell'architettura MobileNetV3-Small originale.
 
-**Proprietà fondamentale (Inductive Bias Locale):** Le convoluzioni hanno receptive field limitato. Al layer $l$ con kernel $k \times k$ e stride $s$, il receptive field effettivo cresce come $r_l = r_{l-1} + (k-1) \cdot \prod_{j < l} s_j$. Nei primi 3 stage di MobileNetV3-Small, con stride complessivo $2^3 = 8$, ogni feature in $P_3$ vede una regione di circa $20$–$30$ pixel dell'immagine originale. Questo è sufficiente per catturare texture locali, bordi e pattern cromatici fini, ma insufficiente per ragionare su dipendenze globali ("cielo arancione → soggetto caldo"). Questa limitazione motiva il secondo modulo.
+**Proprietà fondamentale (Inductive Bias Locale):** Le convoluzioni hanno receptive field limitato. Al layer $l$ con kernel $k \times k$ e stride $s$, il receptive field effettivo cresce come $r_l = r_{l-1} + (k-1) \cdot \prod_{j < l} s_j$. Nei primi 3 stage di MobileNetV3-Small, con stride complessivo $2^4 = 16$, ogni feature in $P_3$ vede una regione di circa $25$–$30$ pixel dell'immagine originale. Questo è sufficiente per catturare texture locali, bordi e pattern cromatici fini, ma insufficiente per ragionare su dipendenze globali ("cielo arancione → soggetto caldo"). Questa limitazione motiva il secondo modulo.
 
 **Strategia di congelamento nel few-shot adaptation**: i parametri degli stage 1 e 2 di $\mathcal{F}^{(1)}, \mathcal{F}^{(2)}$ vengono congelati nelle prime 10 epoche della fase di adattamento. Formalmente, si partiziona il parametro space $\Theta = \Theta_{frozen} \cup \Theta_{adapt}$ dove $\Theta_{frozen} = \{\theta_1, \theta_2\}$ e il gradiente viene bloccato: $\nabla_{\Theta_{frozen}} \mathcal{L} := 0$. Questo previene il catastrophic forgetting delle rappresentazioni di basso livello apprese su ImageNet.
 
