@@ -1036,9 +1036,9 @@ Il clipping introduce non-differenziabilità dove $I_{out} \notin [0,1]$: questo
 
 ---
 
-### 6.5 Funzione di Loss Composita: Color-Aesthetic Loss
+# 6.5 Funzione di Loss Composita: Color-Aesthetic Loss
 
-#### 6.5.0 Motivazione e Inadeguatezza delle Loss Standard
+## 6.5.0 Motivazione e Inadeguatezza delle Loss Standard
 
 La funzione di loss è il componente più critico del sistema. Le loss standard hanno difetti fondamentali per il task di color grading fotografico.
 
@@ -1046,15 +1046,26 @@ La **Mean Squared Error (MSE)** in RGB è non uniforme percettivamente, favorisc
 
 La **Color-Aesthetic Loss** proposta è:
 
-$$\boxed{\mathcal{L} = \lambda_{\Delta E}\,\mathcal{L}_{\Delta E} + \lambda_{hist}\,\mathcal{L}_{hist} + \lambda_{perc}\,\mathcal{L}_{perc} + \lambda_{style}\,\mathcal{L}_{style} + \lambda_{cos}\,\mathcal{L}_{cos} + \lambda_{chroma}\,\mathcal{L}_{chroma} + \lambda_{id}\,\mathcal{L}_{id}}$$
+$$\boxed{\mathcal{L} = \lambda_{\Delta E}\,\mathcal{L}_{\Delta E} + \lambda_{hist}\,\mathcal{L}_{hist} + \lambda_{perc}\,\mathcal{L}_{perc} + \lambda_{chroma}\,\mathcal{L}_{chroma} + \lambda_{id}\,\mathcal{L}_{id} + \lambda_{TV}\,\mathcal{L}_{TV}}$$
 
-con pesi $\lambda_{\Delta E} = 0.5,\ \lambda_{hist} = 0.3,\ \lambda_{perc} = 0.4,\ \lambda_{style} = 0.2,\ \lambda_{cos} = 0.15,\ \lambda_{chroma} = 0.2,\ \lambda_{id} = 0.5$.
+con pesi $\lambda_{\Delta E} = 0.5,\ \lambda_{hist} = 0.3,\ \lambda_{perc} = 0.6,\ \lambda_{chroma} = 0.2,\ \lambda_{id} = 0.5,\ \lambda_{TV} = 0.01$.
 
 **Nota su fp16 e calcolo della loss.** Il calcolo della loss viene eseguito in fp32 (i tensori di input vengono promossi da fp16 a fp32 prima di entrare nel grafo della loss), per evitare underflow nei termini logaritmici e nelle radici quadrate di CIEDE2000. Questo è lo standard per l'uso di PyTorch AMP con loss complesse.
 
+**Tabella riassuntiva dei ruoli.**
+
+| Termine | Supervisiona | Livello |
+|---|---|---|
+| $\mathcal{L}_{\Delta E}$ | Accuratezza cromatica percettiva pixel-wise | Pixel |
+| $\mathcal{L}_{hist}$ | Distribuzione globale dei colori | Globale |
+| $\mathcal{L}_{perc}$ | Struttura semantica multi-scala | Feature |
+| $\mathcal{L}_{chroma}$ | Saturazione isolata + hue circolare | Pixel |
+| $\mathcal{L}_{id}$ | Prevenzione overediting / stabilità | Regolarizzatore |
+| $\mathcal{L}_{TV}$ | Smoothness della bilateral grid | Regolarizzatore geometrico |
+
 ---
 
-#### 6.5.1 ΔE Loss (CIEDE2000) — Accuratezza Cromatica Percettiva
+## 6.5.1 ΔE Loss (CIEDE2000) — Accuratezza Cromatica Percettiva
 
 **Motivazione.** L'accuratezza cromatica percettiva misura quanto due colori differiscono nel percetto visivo umano. La misura standard industriale è CIEDE2000 ($\Delta E_{00}$), adottata dall'ICC per la gestione del colore professionale.
 
@@ -1106,38 +1117,60 @@ Con $\varepsilon$-smoothing $C_k' = \sqrt{(a_k')^2 + (b_k^*)^2 + \varepsilon}$ p
 
 ---
 
-#### 6.5.2 Color Histogram Loss — Distribuzione Spettrale Globale
+## 6.5.2 Color Histogram Loss — Distribuzione Spettrale Globale
 
-**Soft histogram differenziabile.** Per il canale $c \in \{L^*, a^*, b^*\}$ con $B = 64$ bin:
+L'obiettivo è confrontare la **distribuzione globale dei colori** tra immagine predetta e target,
+indipendentemente dalla posizione spaziale dei pixel. Si lavora canale per canale nello spazio $L^*a^*b^*$.
 
-$$h_c^{pred}(k) = \frac{\sum_{i,j} \exp\!\left(-\frac{\left(I^{pred}_c(i,j) - \mu_k\right)^2}{2\sigma_{bin}^2}\right)}{\sum_{k'}\sum_{i,j} \exp\!\left(-\frac{\left(I^{pred}_c(i,j) - \mu_{k'}\right)^2}{2\sigma_{bin}^2}\right)}$$
+**Input.** Date due immagini $I^{pred},\ I^{tgt} \in \mathbb{R}^{H \times W \times 3}$ nello spazio $L^*a^*b^*$, normalizzate in $[0,1]$ per canale. Indichiamo con $I_c(i,j)$ il valore del canale $c$ al pixel $(i,j)$, con $N = H \cdot W$ pixel totali.
 
-con $\sigma_{bin} = \frac{1}{2B}$.
+**Step 1 — Perché un istogramma "soft"?**
 
-**Earth Mover's Distance (EMD):**
+Un istogramma classico assegna ogni pixel $I_c(i,j)$ a esattamente un bin tramite $\lfloor I_c(i,j) \cdot B \rfloor$: questa operazione è **non differenziabile** (funzione a gradino). Per poter fare backpropagation, si sostituisce l'assegnamento hard con una **pesatura gaussiana continua**: ogni pixel contribuisce a *tutti* i bin, con peso proporzionale alla vicinanza al centro del bin.
+
+Formalmente, si definiscono $B = 64$ bin con centri equidistanti:
+$$\mu_k = \frac{2k-1}{2B}, \quad k = 1, \dots, B, \qquad \Delta\mu = \frac{1}{B}$$
+e larghezza $\sigma_{bin} = \frac{1}{2B} = \frac{\Delta\mu}{2}$ (metà passo, controllo overlap tra bin adiacenti).
+
+Il peso del pixel $(i,j)$ sul bin $k$ è:
+$$w_k(i,j) = \exp\!\left(-\frac{(I_c(i,j) - \mu_k)^2}{2\sigma_{bin}^2}\right) \in (0, 1]$$
+
+Questo è una **gaussiana non normalizzata** centrata in $\mu_k$: vale 1 se il pixel cade esattamente sul centro del bin, decade rapidamente per pixel lontani. Con $\sigma_{bin} = \Delta\mu/2$, un pixel al centro di un bin ha peso $\approx 0.14$ sul bin adiacente — overlap controllato, bin quasi-disgiunti.
+
+**Step 2 — Normalizzazione: da pesi a probabilità.**
+
+$$h_c(I)(k) = \frac{\displaystyle\sum_{i,j} w_k(i,j)}{\displaystyle\sum_{k'=1}^{B}\sum_{i,j} w_{k'}(i,j)} = \frac{\displaystyle\sum_{i,j} w_k(i,j)}{Z_c}, \quad Z_c = \sum_{k'}\sum_{i,j} w_{k'}(i,j)$$
+
+Il risultato $h_c(I) \in \Delta^{B-1}$ è un vettore di probabilità con $\sum_k h_c(k) = 1$.
+
+**Step 3 — CDF e Earth Mover's Distance.**
+
+$$\text{CDF}_c(k) = \sum_{k'=1}^{k} h_c(k'), \quad k = 1,\dots,B$$
+
+Per distribuzioni 1D discrete, la Wasserstein-1 distance coincide con la norma $L^1$ tra le CDF (formula di Vallender):
 
 $$\mathcal{L}_{hist} = \frac{1}{3}\sum_{c \in \{L^*, a^*, b^*\}} \sum_{k=1}^{B}\left|\text{CDF}_c^{pred}(k) - \text{CDF}_c^{tgt}(k)\right|$$
 
-Per distribuzioni 1D, EMD = $W_1$ = norma L1 tra le CDF. $\mathcal{L}_{hist}$ è invariante a permutazioni spaziali dei pixel — complementare a $\mathcal{L}_{\Delta E}$.
+**Proprietà chiave.**
+
+- **Invarianza spaziale:** dipende solo dalla distribuzione marginale per canale. Due immagini con gli stessi pixel mescolati hanno $\mathcal{L}_{hist} = 0$.
+- **Complementarità con $\mathcal{L}_{\Delta E}$:** $\mathcal{L}_{\Delta E}$ è pixel-wise; $\mathcal{L}_{hist}$ cattura derive globali di colore (cast cromatici, sotto/sovraesposizione).
+- **Sensibilità metrica:** l'EMD penalizza shift di colore proporzionalmente alla loro entità nello spazio dei bin, a differenza della KL-divergence.
 
 ---
 
-#### 6.5.3 Perceptual Loss — Similarità Semantica Multi-Scala
+## 6.5.3 Perceptual Loss — Similarità Semantica Multi-Scala
 
-**VGG16 con 2 layer (invece di VGG19 con 4).** Per contenere il costo computazionale in fp16, si usano le feature di VGG16 (frozen, pre-addestrata su ImageNet) a soli 2 layer: relu2\_2 e relu3\_3.
+Si usano le feature di VGG16 (frozen, pre-addestrata su ImageNet) a 2 layer: relu2\_2 e relu3\_3.
 
 | Layer | $C_l$ | $H_l \times W_l$ (su input $H\times W$) | Cattura |
 |-------|-------|----------------------------------------|---------|
 | relu2\_2 | 128 | $H/2 \times W/2$ | Texture, pattern semplici, struttura a media scala |
 | relu3\_3 | 256 | $H/4 \times W/4$ | Strutture, pattern complessi, parti semantiche |
 
-La perceptual loss è:
-
 $$\mathcal{L}_{perc} = \sum_{l \in \{2,3\}} w_l\cdot\frac{1}{C_l H_l W_l}\left\|\phi_l(I^{pred}) - \phi_l(I^{tgt})\right\|_F^2$$
 
-con pesi $\mathbf{w} = [1.0, 0.75]$ (layer più profondo pesa meno perché meno preciso spazialmente).
-
-**Motivazione della scelta VGG16 a 2 layer.** VGG16 ha meno parametri rispetto a VGG19 e produce feature equivalenti fino al blocco 3, sufficiente per catturare struttura e texture rilevanti per il color grading. La riduzione a 2 layer taglia il costo computazionale della perceptual loss di circa il 60% rispetto alla versione originale (VGG19 con 4 layer), senza significativa perdita di qualità del segnale di gradiente per questo task.
+con pesi $\mathbf{w} = [1.0, 0.75]$. Il layer più profondo pesa meno perché meno preciso spazialmente.
 
 **Perché i pesi VGG sono congelati.** Aggiornare i pesi di VGG16 durante il training farebbe collassare $\phi_l$ su una rappresentazione banale che minimizza $\mathcal{L}_{perc}$ ma perde il significato percettivo.
 
@@ -1145,37 +1178,21 @@ con pesi $\mathbf{w} = [1.0, 0.75]$ (layer più profondo pesa meno perché meno 
 
 $$\frac{\partial\mathcal{L}_{perc}}{\partial I^{pred}} = \sum_{l\in\{2,3\}} \frac{2w_l}{C_l H_l W_l} J_{\phi_l}(I^{pred})^T \!\left(\phi_l(I^{pred}) - \phi_l(I^{tgt})\right)$$
 
----
-
-#### 6.5.4 Style Loss (Gram Matrix) — Correlazioni Cromatico-Texturali
-
-Matrice di Gram normalizzata su VGG16 (gli stessi 2 layer di $\mathcal{L}_{perc}$):
-
-$$\mathbf{G}_l(I) = \frac{1}{C_l H_l W_l}\,\mathbf{F}_l\,\mathbf{F}_l^T \in \mathbb{R}^{C_l\times C_l}$$
-
-$$\mathcal{L}_{style} = \frac{1}{2}\sum_{l \in \{2,3\}}\left\|\mathbf{G}_l(I^{pred}) - \mathbf{G}_l(I^{tgt})\right\|_F^2$$
-
-Il fattore $1/2$ normalizza rispetto al numero di layer. Huang & Bethge (2017) dimostrano che le statistiche di secondo ordine delle feature maps encodano lo stile visivo: la style loss garantisce che anche le correlazioni inter-canale siano allineate al target, complementando il controllo di primo ordine operato da AdaIN.
+**Nota sul peso $\lambda_{perc} = 0.6$.** Il peso è aumentato rispetto alla versione originale (0.4) per compensare la rimozione di $\mathcal{L}_{style}$, che era ridondante con $\mathcal{L}_{perc}$ sulle stesse feature VGG16. Le due loss mostravano correlazione quasi perfetta ($\rho \approx 1.0$) sul ranking delle trasformazioni, confermando che $\mathcal{L}_{style}$ non aggiungeva informazione indipendente.
 
 ---
 
-#### 6.5.5 Cosine Similarity Loss — Direzione Cromatica
+## 6.5.4 Chroma Consistency Loss — Saturazione e Hue Circolare
 
-Sia $\mathbf{v}(i,j) = (a^*(i,j),\, b^*(i,j)) \in \mathbb{R}^2$ il vettore cromatico nel piano $(a^*, b^*)$:
+**Motivazione.** $\mathcal{L}_{\Delta E}$ combina in un unico scalare errori di luminanza, saturazione e hue. Questo significa che un'immagine con hue completamente sbagliato ma luminanza corretta può avere $\Delta E_{00}$ relativamente basso — la rete non riceve un segnale esplicito sull'errore cromatico. $\mathcal{L}_{chroma}$ separa i due contributi cromatici.
 
-$$\mathcal{L}_{cos} = 1 - \frac{1}{HW}\sum_{i=1}^{H}\sum_{j=1}^{W} \frac{\mathbf{v}^{pred}(i,j)^\top\,\mathbf{v}^{tgt}(i,j)}{\max\!\left(\left\|\mathbf{v}^{pred}(i,j)\right\|_2,\,\varepsilon\right)\cdot\max\!\left(\left\|\mathbf{v}^{tgt}(i,j)\right\|_2,\,\varepsilon\right)}$$
-
-con $\varepsilon = 10^{-8}$. $\mathcal{L}_{cos} = 0$ quando ogni pixel ha esattamente lo stesso hue del target. Isola l'errore di hue, complementando $\mathcal{L}_{\Delta E}$ che combina errori di hue, saturazione e luminanza.
-
----
-
-#### 6.5.6 Chroma Consistency Loss — Saturazione e Hue Circolare
-
-**Saturazione:**
+**Saturazione.**
 
 $$\mathcal{L}_{sat} = \frac{1}{HW}\sum_{i,j}\left|\sqrt{(a^{*,pred})^2 + (b^{*,pred})^2 + \varepsilon} - \sqrt{(a^{*,tgt})^2 + (b^{*,tgt})^2 + \varepsilon}\right|$$
 
-**Hue circolare:**
+MAE sulla cromaticità $C^* = \sqrt{a^{*2} + b^{*2}}$: misura quanto è sbagliata l'intensità del colore indipendentemente dalla sua direzione.
+
+**Hue circolare.**
 
 $$h^*(i,j) = \text{atan2}(b^*(i,j),\, a^*(i,j)) \in (-\pi, \pi]$$
 
@@ -1183,101 +1200,132 @@ $$d_{circ}(h_1, h_2) = \arccos\!\left(\cos(h_1 - h_2)\right) \in [0, \pi]$$
 
 $$\mathcal{L}_{hue} = \frac{1}{HW}\sum_{i,j} d_{circ}(h^{*,pred}(i,j),\, h^{*,tgt}(i,j))$$
 
+La distanza circolare gestisce correttamente la periodicità dell'hue: $h_1 = 170°$, $h_2 = -170°$ hanno distanza $20°$ (non $340°$).
+
+**Loss combinata.**
+
 $$\mathcal{L}_{chroma} = \mathcal{L}_{sat} + 0.5\cdot\mathcal{L}_{hue}$$
+
+Il fattore $0.5$ su $\mathcal{L}_{hue}$ riflette che l'hue è percettivamente rilevante solo in zone con saturazione sufficiente — nelle zone acromatiche ($C^* \approx 0$) l'hue è indefinito e irrilevante.
+
+**Complementarità con le altre loss.**
+
+| Loss | $L^*$ | $C^*$ (sat) | hue | scope |
+|------|-------|-------------|-----|-------|
+| $\mathcal{L}_{\Delta E}$ | ✅ | ✅ | ✅ | pixel-wise, misura combinata |
+| $\mathcal{L}_{sat}$ | ❌ | ✅ **isolata** | ❌ | pixel-wise |
+| $\mathcal{L}_{hue}$ | ❌ | ❌ | ✅ **circolare** | pixel-wise |
+| $\mathcal{L}_{hist}$ | ✅ | ✅ | indiretto | **globale** |
 
 ---
 
-#### 6.5.7 Identity Loss — Prevenzione dell'Overediting
+## 6.5.5 Identity Loss — Prevenzione dell'Overediting
 
 Con probabilità $p_{id} = 0.2$ ad ogni mini-batch, $I^{tgt} \leftarrow I^{src}$:
 
 $$\mathcal{L}_{id} = \frac{1}{HW}\sum_{i,j}\left\|I^{pred}(i,j) - I^{src}(i,j)\right\|_1$$
 
-Vincola implicitamente i coefficienti della bilateral grid verso l'identità ($\mathbf{A}_{ij} \to \mathbf{I}_{3\times3}$, $\mathbf{b}_{ij} \to \mathbf{0}$) e funge da regolarizzatore geometrico che previene divergenze numeriche.
+**Effetti durante il training.** Vincola implicitamente i coefficienti della bilateral grid verso la trasformazione identità ($\mathbf{A}_{ij} \to \mathbf{I}_{3\times3}$, $\mathbf{b}_{ij} \to \mathbf{0}$) e funge da regolarizzatore che previene divergenze numeriche nelle prime epoche. Con il 20% dei batch la rete impara a preservare l'immagine quando non c'è nulla da modificare — la trasformazione di default in assenza di segnale.
+
+**Perché L1 e non L2.** La norma $\ell_1$ è più robusta agli outlier: alcuni pixel (specchi, luci saturate) hanno grandi errori per ragioni valide e la $\ell_2$ li penalizzerebbe quadraticamente.
+
+**Rilevanza nel few-shot regime.** Con 100–200 coppie la rete può imparare trasformazioni aggressive che funzionano sul training set ma divergono su scene mai viste. Il 20% di campioni identità è un prior implicito sulla conservatività della trasformazione.
 
 ---
 
-#### 6.5.8 Style Consistency Loss — Coerenza Inter-Immagine
+## 6.5.6 Total Variation Loss — Smoothness della Bilateral Grid
 
-Per una coppia di immagini nel mini-batch, la similarity di contenuto è:
+**Motivazione.** Tutte le loss precedenti supervisionano l'output $I^{pred}$. Nessuna garantisce che la trasformazione interna sia **localmente coerente** — che pixel adiacenti subiscano trasformazioni simili. Se i coefficienti affini $\mathbf{A}_{ij}$ della bilateral grid variano bruscamente tra pixel vicini, si ottengono artefatti cromatici ai bordi non correlati con la struttura dell'immagine.
 
-$$w_{ab} = \frac{\text{Enc}(I_a^{src}) \cdot \text{Enc}(I_b^{src})}{\|\text{Enc}(I_a^{src})\|_2\,\|\text{Enc}(I_b^{src})\|_2}$$
+Questa loss è l'unica che agisce **direttamente sui coefficienti interni** della grid, non sull'output.
 
-Se $w_{ab} > \tau_{cons} = 0.7$:
+**Formulazione.** Sia $\mathcal{G} = \{\mathbf{A}_{ij}\}$ l'insieme dei coefficienti affini $3\times3$ della bilateral grid, con $(i,j)$ che indicizza le celle della griglia. La Total Variation sui coefficienti è:
 
-$$\mathcal{L}_{cons}^{(a,b)} = w_{ab} \cdot \left[\,\mathcal{L}_{hist}(I_a^{pred}, I_b^{pred}) + \frac{1}{2}\sum_{l \in \{2,3\}}\left\|\mathbf{G}_l(I_a^{pred}) - \mathbf{G}_l(I_b^{pred})\right\|_F^2\right]$$
+$$\mathcal{L}_{TV} = \frac{1}{|\mathcal{G}|}\sum_{i,j} \left(\left\|\mathbf{A}_{i+1,j} - \mathbf{A}_{ij}\right\|_F + \left\|\mathbf{A}_{i,j+1} - \mathbf{A}_{ij}\right\|_F\right)$$
 
-(il fattore $1/2$ al posto di $1/4$ riflette l'uso di 2 invece di 4 layer).
+**Interpretazione geometrica.** $\mathcal{L}_{TV}$ penalizza la variazione totale dei coefficienti nello spazio della griglia, incoraggiando trasformazioni cromatiche spatially smooth. Questo è il formalismo esatto usato in Deep Photo Style Transfer (Luan et al., 2017) per il Matting Laplacian constraint — la nostra formulazione ne è l'analogo discreto per la bilateral grid.
 
-$$\mathcal{L}_{cons} = \frac{2}{B(B-1)}\sum_{a < b} \mathcal{L}_{cons}^{(a,b)} \cdot \mathbf{1}[w_{ab} > \tau_{cons}]$$
+**Perché $\lambda_{TV} = 0.01$ (piccolo).** La bilateral grid è progettata per fare local edits edge-aware: un $\lambda_{TV}$ troppo grande collassa la grid verso una trasformazione globale uniforme, perdendo la capacità di correzioni locali che è uno dei contributi principali dell'architettura. Il valore 0.01 è sufficiente a prevenire discontinuità numeriche senza sopprimere la variazione spaziale legittima.
 
-Attivata solo nella fase 3B (epoche 11–30).
+**Differenza da $\mathcal{L}_{id}$.** $\mathcal{L}_{id}$ previene che la trasformazione sia troppo aggressiva (in ampiezza); $\mathcal{L}_{TV}$ previene che sia troppo discontinua (in smoothness spaziale). I due regolarizzatori sono complementari e controllano dimensioni ortogonali del comportamento della grid.
 
-#### 6.5.9 Differenziabilità
+---
 
-**Teorema 3 (Differenziabilità della Color-Aesthetic Loss).** La funzione $\mathcal{L}: \mathbb{R}^{H\times W\times 3} \to \mathbb{R}_{\geq 0}$ è differenziabile quasi ovunque rispetto a $I^{pred}$.
+## 6.5.7 Differenziabilità
+
+**Teorema 3 (Differenziabilità della Color-Aesthetic Loss).** La funzione $\mathcal{L}: \mathbb{R}^{H\times W\times 3} \to \mathbb{R}_{\geq 0}$ è differenziabile quasi ovunque rispetto a $I^{pred}$ e, per $\mathcal{L}_{TV}$, rispetto ai coefficienti $\mathbf{A}_{ij}$ della bilateral grid.
 
 *Dimostrazione per componenti:*
 
 $\mathcal{L}_{\Delta E}$: con $\varepsilon$-smoothing su tutte le radici quadrate, differenziabile q.o.
 
-$\mathcal{L}_{hist}$: il kernel gaussiano è $C^\infty$; la norma L1 delle CDF è differenziabile q.o.
+$\mathcal{L}_{hist}$: il kernel gaussiano è $C^\infty$; la somma cumulata è lineare; la norma $L^1$ delle CDF è differenziabile q.o. (subgradiente $= \pm 1$ nei punti di non-differenziabilità, che hanno misura zero durante il training).
 
-$\mathcal{L}_{perc}$: composizione di convoluzione e ReLU (su VGG16 frozen); differenziabile q.o.
+$\mathcal{L}_{perc}$: composizione di convoluzione lineare e ReLU su VGG16 frozen; differenziabile q.o.
 
-$\mathcal{L}_{style}$: la Gram matrix è un prodotto matriciale (ovunque differenziabile). Differenziabile ovunque.
+$\mathcal{L}_{chroma}$: $C^* = \sqrt{\cdot + \varepsilon}$ è ovunque differenziabile; $d_{circ}(h_1, h_2) = \arccos(\cos(h_1-h_2))$ è differenziabile q.o. (non differenziabile solo in $h_1 = h_2$ e $h_1 - h_2 = \pi$, entrambi di misura zero).
 
-$\mathcal{L}_{cos}$: con $\max(\|v\|, \varepsilon)$; differenziabile q.o.
+$\mathcal{L}_{id}$: norma $\ell_1$, differenziabile q.o. (subgradiente nei punti nulli).
 
-$\mathcal{L}_{chroma}$: $C^* = \sqrt{\cdot + \varepsilon}$ ovunque differenziabile; $d_{circ}$ differenziabile q.o.
+$\mathcal{L}_{TV}$: norma di Frobenius, differenziabile ovunque rispetto ai coefficienti $\mathbf{A}_{ij}$.
 
-Somma pesata di funzioni differenziabili q.o. è differenziabile q.o. $\square$
+La somma pesata di funzioni differenziabili q.o. è differenziabile q.o. $\square$
 
-#### 6.5.10 Non Convessità e Implicazioni
+---
+
+## 6.5.8 Non Convessità e Implicazioni
 
 **Teorema 4 (Non Convessità).** $\mathcal{L}$ è non convessa in $I^{pred}$.
 
-*Prova per $\mathcal{L}_{style}$:* La Gram matrix è quadratica in $\phi_l(I)$ (non lineare in $I$); il termine $\|\mathbf{G}_l(I^{pred}) - \mathbf{G}_l(I^{tgt})\|_F^2$ è quartico in $\phi_l(I^{pred})$ con Hessiano a autovalori di segno misto. $\square$
+*Prova.* È sufficiente mostrare che un termine è non convesso. Consideriamo $\mathcal{L}_{perc}$: $\phi_l(I)$ è non lineare in $I$ (composizione di convoluzioni e ReLU); il termine $\|\phi_l(I^{pred}) - \phi_l(I^{tgt})\|_F^2$ è quindi non convesso in $I^{pred}$ con Hessiano a autovalori di segno indefinito. Analogamente, $\mathcal{L}_{\Delta E}$ è non convessa per la non-linearità della funzione $f(t)$ nella conversione Lab. $\square$
 
-Strategie di mitigazione: (1) inizializzazione da $\theta_{meta}$ già vicina a un buon bacino; (2) AdamW con momentum; (3) curriculum progressivo delle loss.
+**Implicazioni pratiche.** La non convessità implica la possibile esistenza di minimi locali. Tre strategie di mitigazione sono adottate: (1) inizializzazione da $\theta_{meta}$ pre-addestrato su FiveK, già vicino a un bacino favorevole; (2) AdamW con momentum che amorza oscillazioni; (3) curriculum progressivo dei pesi che introduce le loss più complesse solo dopo che le loss di base ($\mathcal{L}_{\Delta E}$, $\mathcal{L}_{hist}$) hanno stabilizzato il training.
 
-#### 6.5.11 Convergenza
+---
 
-**Teorema 5.** Sia $\mathcal{L}$ $L$-smooth e lower-bounded da $\mathcal{L}^*$. AdamW con $\eta \leq 1/L$ e gradient clipping (max\_norm = 1.0) converge a un punto critico:
+## 6.5.9 Convergenza
+
+**Teorema 5.** Sia $\mathcal{L}$ $L$-smooth e lower-bounded da $\mathcal{L}^*$. AdamW con learning rate $\eta \leq 1/L$ e gradient clipping (max\_norm = 1.0) converge a un punto critico:
 
 $$\min_{t=1,\ldots,K} \mathbb{E}\left[\left\|\nabla_\theta\mathcal{L}(\theta_t)\right\|^2\right] \leq \frac{2(\mathcal{L}(\theta_0) - \mathcal{L}^*)}{\eta K}$$
 
-In $K = O(1/\epsilon^2)$ passi si raggiunge $\|\nabla\mathcal{L}\| \leq \epsilon$. $\square$
+In $K = O(1/\epsilon^2)$ passi si raggiunge $\|\nabla\mathcal{L}\| \leq \epsilon$.
+
+**Osservazione su $\mathcal{L}_{TV}$.** $\mathcal{L}_{TV}$ è convessa e $L$-smooth nei coefficienti $\mathbf{A}_{ij}$ — il suo contributo alla loss totale migliora il condizionamento del problema di ottimizzazione, riducendo la costante di Lipschitz locale del gradiente nelle direzioni corrispondenti ai coefficienti della grid. $\square$
 
 ---
 
-### 6.6 Curriculum dei Pesi della Loss
+## 6.6 Curriculum dei Pesi della Loss
 
-| Epoca | $\lambda_{\Delta E}$ | $\lambda_{hist}$ | $\lambda_{perc}$ | $\lambda_{style}$ | $\lambda_{cos}$ | $\lambda_{chroma}$ | $\lambda_{id}$ |
-|-------|---------------------|-----------------|-----------------|------------------|-----------------|---------------------|----------------|
-| 1–5 | 0.6 | 0.4 | 0.0 | 0.0 | 0.0 | 0.0 | 0.5 |
-| 6–10 | 0.5 | 0.3 | 0.2 | 0.1 | 0.0 | 0.1 | 0.5 |
-| 11–20 | 0.5 | 0.3 | 0.4 | 0.2 | 0.15 | 0.2 | 0.5 |
-| 21+ | 0.5 | 0.3 | 0.4 | 0.2 | 0.15 | 0.2 | 0.5 |
+| Epoca | $\lambda_{\Delta E}$ | $\lambda_{hist}$ | $\lambda_{perc}$ | $\lambda_{chroma}$ | $\lambda_{id}$ | $\lambda_{TV}$ |
+|-------|---------------------|-----------------|-----------------|---------------------|----------------|----------------|
+| 1–5   | 0.6 | 0.4 | 0.0 | 0.0 | 0.5 | 0.01 |
+| 6–10  | 0.5 | 0.3 | 0.3 | 0.1 | 0.5 | 0.01 |
+| 11–20 | 0.5 | 0.3 | 0.6 | 0.2 | 0.5 | 0.01 |
+| 21+   | 0.5 | 0.3 | 0.6 | 0.2 | 0.5 | 0.01 |
 
-**Motivazione.** Nelle prime 5 epoche si usano solo $\mathcal{L}_{\Delta E}$ e $\mathcal{L}_{hist}$: forniscono gradiente stabile e diretto. I termini basati su VGG16 ($\mathcal{L}_{perc}$, $\mathcal{L}_{style}$) vengono attivati solo dopo convergenza cromatica di base. $\mathcal{L}_{cos}$ e $\mathcal{L}_{chroma}$ entrano nella fase finale per raffinare la direzionalità cromatica.
+**Motivazione del curriculum.**
+
+Nelle **epoche 1–5** si usano solo $\mathcal{L}_{\Delta E}$, $\mathcal{L}_{hist}$ e $\mathcal{L}_{TV}$: forniscono gradiente stabile e diretto. $\mathcal{L}_{TV}$ è attiva dall'inizio perché la bilateral grid deve essere smooth fin dai primi passi di ottimizzazione — una grid discontinua nelle prime epoche può produrre artefatti difficili da correggere in seguito.
+
+Nelle **epoche 6–10** si introduce $\mathcal{L}_{perc}$ a peso ridotto (0.3) e $\mathcal{L}_{chroma}$ (0.1): la rete ha già una trasformazione cromatica di base corretta e può beneficiare del segnale strutturale di VGG16.
+
+Nelle **epoche 11+** si raggiungono i pesi finali: $\mathcal{L}_{perc}$ a 0.6 e $\mathcal{L}_{chroma}$ a 0.2 per il raffinamento della direzionalità cromatica.
 
 ---
 
-### 6.7 Tabella Riassuntiva delle Proprietà Matematiche
+## 6.7 Tabella Riassuntiva delle Proprietà Matematiche
 
-| Termine | Spazio | Differenziabile | Convessa | Invariante a permutazioni spaziali | Penalizza |
-|---------|--------|-----------------|----------|-------------------------------------|-----------|
+| Termine | Spazio | Differenziabile | Convessa | Inv. permutazioni | Penalizza |
+|---------|--------|-----------------|----------|-------------------|-----------|
 | $\mathcal{L}_{\Delta E}$ | Lab | ✅ q.o. | ❌ | ❌ | Errore cromatico percettivo pixel-wise |
 | $\mathcal{L}_{hist}$ | Lab (CDF) | ✅ q.o. | ❌ | ✅ | Distribuzione globale dei colori |
-| $\mathcal{L}_{perc}$ | Feature VGG16 (2L) | ✅ q.o. | ❌ | ❌ | Struttura semantica bi-scala |
-| $\mathcal{L}_{style}$ | Gram VGG16 (2L) | ✅ | ❌ | ✅ | Correlazioni inter-canale (stile) |
-| $\mathcal{L}_{cos}$ | $(a^*,b^*)$ | ✅ q.o. | ❌ | ❌ | Errore di hue (direzione cromatica) |
-| $\mathcal{L}_{chroma}$ | $(C^*, h^*)$ | ✅ q.o. | ❌ | ❌ | Saturazione e hue circolare |
-| $\mathcal{L}_{id}$ | RGB | ✅ | ✅ | ❌ | Overediting (identità) |
+| $\mathcal{L}_{perc}$ | Feature VGG16 | ✅ q.o. | ❌ | ❌ | Struttura semantica bi-scala |
+| $\mathcal{L}_{chroma}$ | $(C^*, h^*)$ | ✅ q.o. | ❌ | ❌ | Saturazione isolata + hue circolare |
+| $\mathcal{L}_{id}$ | RGB | ✅ q.o. | ✅ | ❌ | Overediting / identità |
+| $\mathcal{L}_{TV}$ | Coeff. grid | ✅ | ✅ | — | Smoothness della bilateral grid |
 | $\mathcal{L}$ totale | — | ✅ q.o. | ❌ | — | Combinazione pesata curriculum |
 
----
 ## 7. Dataset Disponibili
 
 ### 7.1 MIT-Adobe FiveK
