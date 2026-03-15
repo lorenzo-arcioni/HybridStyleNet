@@ -123,82 +123,43 @@ def bilateral_slice(
     img:   torch.Tensor,    # (B, 3, H, W)
     guide: torch.Tensor,    # (B, H, W) ∈ [0, 1]
 ) -> torch.Tensor:
-    """
-    Interpolazione trilineare differenziabile sulla bilateral grid.
-
-    Per ogni pixel (i,j):
-      coords = (j/(W-1)·(s-1), i/(H-1)·(s-1), guide(i,j)·(l-1))
-      coeffs = trilinear_interp(grid, coords)
-      out(i,j) = A_ij · img(i,j) + b_ij
-
-    La grid ha n_coeff=12 → 3×3 matrice affine (A) + 3 bias (b).
-
-    Parameters
-    ----------
-    grid  : bilateral grid con coefficienti affini
-    img   : immagine sorgente
-    guide : guida di slicing ∈ [0,1]
-
-    Returns
-    -------
-    out : (B, 3, H, W)  immagine trasformata
-    """
     B, n_coeff, s_sp, _, s_lum = grid.shape
     _, _, H, W = img.shape
 
-    # Coordinate normalizzate per grid_sample: range [-1, 1]
-    # x_spatial:  j / (W-1) → [-1, 1]
-    # y_spatial:  i / (H-1) → [-1, 1]
-    # z_lum:      guide      → [-1, 1]
-
-    # Griglia di coordinate pixel (H × W)
-    y_coords = torch.linspace(-1, 1, H, device=img.device)  # (H,)
-    x_coords = torch.linspace(-1, 1, W, device=img.device)  # (W,)
+    # Coordinate normalizzate in [-1, 1]
+    y_coords = torch.linspace(-1, 1, H, device=img.device)
+    x_coords = torch.linspace(-1, 1, W, device=img.device)
     yy, xx   = torch.meshgrid(y_coords, x_coords, indexing="ij")
 
-    # Coordinate di luminanza dalla guida: (B, H, W) → [-1, 1]
     zz = guide * 2.0 - 1.0                       # (B, H, W)
 
-    # grid_sample richiede: (B, H, W, 3) con ordine (x, y, z)
-    # Per un volume (D, H, W): coords = (x_w, y_h, z_d)
-    # Qui il volume è (s_lum, s_sp, s_sp): depth=lum, height=sp, width=sp
     xx_exp = xx.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
     yy_exp = yy.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
 
-    sample_coords = torch.stack(
-        [xx_exp, yy_exp, zz], dim=-1              # (B, H, W, 3)
-    )
+    # sample_coords: (B, H, W, 3)
+    sample_coords = torch.stack([xx_exp, yy_exp, zz], dim=-1)
+    # Per grid_sample 5D: (B, 1, H, W, 3)
+    sample_coords_5d = sample_coords.unsqueeze(1)
 
-    # Interpola tutti i canali della grid contemporaneamente
-    # grid_sample input: (B, C, D, H, W) — riordiniamo la grid
-    # grid attuale: (B, n_coeff, s_sp, s_sp, s_lum)
-    # grid_sample si aspetta: (B, C, D, H, W) con D=depth(lum), H=sp, W=sp
-    grid_5d = grid.permute(0, 1, 4, 2, 3)        # (B, n_coeff, s_lum, s_sp, s_sp)
+    # grid_5d: (B, n_coeff, s_lum, s_sp, s_sp)
+    grid_5d = grid.permute(0, 1, 4, 2, 3)
 
+    # Interpola ogni canale separatamente per evitare il problema del batch
+    # grid_sample 5D: input (B, C, D, H, W), grid (B, 1, H, W, 3)
     coeffs = F.grid_sample(
         grid_5d,
-        sample_coords.unsqueeze(1).expand(-1, n_coeff, -1, -1, -1)
-        .reshape(B * n_coeff, 1, H, W, 3),
+        sample_coords_5d.expand(-1, 1, -1, -1, -1),
         mode="bilinear", align_corners=True, padding_mode="border",
     )
-    # Risultato: (B*n_coeff, 1, H, W) → (B, n_coeff, H, W)
-    coeffs = coeffs.reshape(B, n_coeff, H, W)
+    # coeffs: (B, n_coeff, 1, H, W) → (B, n_coeff, H, W)
+    coeffs = coeffs.squeeze(2)
 
-    # Applica trasformazione affine: A (3×3) + b (3)
-    # coeffs[:, :9]  → A (matrice 3×3 reshapata)
-    # coeffs[:, 9:]  → b (bias 3)
-    A = coeffs[:, :9, :, :]                       # (B, 9, H, W)
-    b = coeffs[:, 9:, :, :]                       # (B, 3, H, W)
+    # Applica trasformazione affine 3x4
+    A = coeffs[:, :9, :, :].reshape(B, 3, 3, H, W)
+    b = coeffs[:, 9:, :, :]                        # (B, 3, H, W)
 
-    # Applica: out_c = Σ_k A[c,k] · img[k] + b[c]
-    img_flat = img.reshape(B, 3, H * W)           # (B, 3, H*W)
-    A_mat    = A.reshape(B, 3, 3, H * W)          # (B, 3, 3, H*W)
-
-    out_flat = torch.einsum("bckhw,bkhw->bchw", A_mat.reshape(B, 3, 3, H, W), img)
-    out      = out_flat + b
-
-    return out                                    # (B, 3, H, W)
-
+    out = torch.einsum("bckhw,bkhw->bchw", A, img) + b
+    return out
 
 # ---------------------------------------------------------------------------
 # GridNet
