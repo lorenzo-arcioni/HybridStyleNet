@@ -218,25 +218,14 @@ def delta_e_2000_mean(
 # ---------------------------------------------------------------------------
 
 def soft_histogram(
-    channel: torch.Tensor,   # (B, H, W)  valori in [vmin, vmax]
+    channel: torch.Tensor,   # (B, H, W) oppure (H, W) — entrambi accettati
     n_bins:  int   = 64,
     vmin:    float = 0.0,
     vmax:    float = 1.0,
 ) -> torch.Tensor:
-    """
-    Istogramma soft differenziabile per un singolo canale.
-
-    Parameters
-    ----------
-    channel : (B, H, W) valori nel range [vmin, vmax]
-    n_bins  : numero di bin
-    vmin    : valore minimo del range
-    vmax    : valore massimo del range
-
-    Returns
-    -------
-    hist : (B, n_bins)  normalizzato (somma = 1)
-    """
+    # Normalizza sempre a (B, H*W)
+    if channel.dim() == 2:
+        channel = channel.unsqueeze(0)   # (1, H, W)
     B      = channel.shape[0]
     delta  = (vmax - vmin) / n_bins
     centers = torch.linspace(
@@ -244,12 +233,11 @@ def soft_histogram(
         n_bins, device=channel.device,
     )
     sigma  = delta * 0.5
-    pixels = channel.reshape(B, -1)                       # (B, H*W)
+    pixels = channel.reshape(B, -1)
     diff   = pixels.unsqueeze(-1) - centers.view(1, 1, -1)
     w      = torch.exp(-diff.pow(2) / (2 * sigma ** 2))
     w_norm = w / (w.sum(-1, keepdim=True) + 1e-8)
-    return w_norm.mean(dim=1)                             # (B, n_bins)
-
+    return w_norm.mean(dim=1)            # (B, n_bins)
 
 # ---------------------------------------------------------------------------
 # lab_channel_stats

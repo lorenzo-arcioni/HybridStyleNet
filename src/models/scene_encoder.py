@@ -276,23 +276,30 @@ class SceneEncoder(nn.Module):
         n_w   : numero di patch orizzontali
         """
         B, C, H, W = img.shape
-        n_h = H // self.patch_size
-        n_w = W // self.patch_size
+        # Assicura che H e W siano multipli del patch_size
+        P    = self.patch_size
+        new_H = (H // P) * P
+        new_W = (W // P) * P
+
+        if new_H != H or new_W != W:
+            img = F.interpolate(
+                img, size=(new_H, new_W),
+                mode="bilinear", align_corners=False, antialias=True,
+            )
+
+        n_h = new_H // P
+        n_w = new_W // P
 
         img_norm = self._normalise_for_dino(img)
 
-        # DINOv2 in eval mode — no grad attraverso il backbone
         with torch.no_grad():
             out = self.backbone.forward_features(img_norm)
 
-        # Estrae i patch tokens (esclude il CLS token)
-        # DINOv2 restituisce dict con chiave "x_norm_patchtokens"
         if isinstance(out, dict) and "x_norm_patchtokens" in out:
-            F_sem = out["x_norm_patchtokens"]     # (B, N, 384)
+            F_sem = out["x_norm_patchtokens"]
         else:
-            # Fallback: prende tutti i token tranne il CLS
             tokens = out if isinstance(out, torch.Tensor) else out["x"]
-            F_sem  = tokens[:, 1:, :]             # (B, N, 384)
+            F_sem  = tokens[:, 1:, :]
 
         return F_sem, n_h, n_w
 
