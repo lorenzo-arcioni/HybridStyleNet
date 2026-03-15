@@ -70,6 +70,8 @@ class ClusterMemory:
         self.desc_dim   = desc_dim
         self.edit_dim   = edit_dim
 
+        self._histograms: List[np.ndarray] = []   # (192,) per immagine — per ranking globale
+
         # Una entry per immagine: shape (N_patches_i, dim)
         self._keys:   List[np.ndarray] = []   # float16
         self._values: List[np.ndarray] = []   # float16
@@ -81,6 +83,7 @@ class ClusterMemory:
         key:   torch.Tensor,   # (N_patches, desc_dim)
         value: torch.Tensor,   # (N_patches, edit_dim)
         meta:  Optional[dict] = None,
+        histogram: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Aggiunge una coppia al cluster.
@@ -94,6 +97,14 @@ class ClusterMemory:
             value.detach().cpu().to(torch.float16).numpy()
         )
         self._meta.append(meta or {})
+
+        # Salva l'istogramma se fornito, altrimenti usa i primi 192 della media delle chiavi
+        if histogram is not None:
+            self._histograms.append(histogram.detach().cpu().float().numpy())
+        else:
+            self._histograms.append(
+                key.detach().cpu().float().mean(dim=0).numpy()[:192]
+            )
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -158,11 +169,9 @@ class ClusterMemory:
         q_norm = q / (np.linalg.norm(q) + 1e-8)
 
         scores = np.zeros(len(self._keys), dtype=np.float32)
-        for i, key in enumerate(self._keys):
-            # media delle patch → (desc_dim,)
-            centroid = key.astype(np.float32).mean(axis=0)
-            c_norm   = centroid / (np.linalg.norm(centroid) + 1e-8)
-            scores[i] = np.dot(q_norm, c_norm)
+        for i, hist in enumerate(self._histograms):
+            h_norm    = hist / (np.linalg.norm(hist) + 1e-8)
+            scores[i] = np.dot(q_norm, h_norm)
 
         return scores
 
@@ -276,6 +285,7 @@ class PhotographerDatabase:
         value:      torch.Tensor,     # (N_patches, edit_dim)
         cluster_id: int,
         meta:       Optional[dict] = None,
+        histogram:  Optional[torch.Tensor] = None
     ) -> None:
         """Aggiunge una coppia pre-calcolata al cluster indicato."""
         if cluster_id not in self.clusters:
