@@ -1,14 +1,20 @@
 """
 losses/histogram.py
 
-Color Histogram Loss con Earth Mover's Distance  (§6.4.2).
+Color Histogram Loss — distribuzione spettrale globale dei colori.
 
-L_hist = (1/3) Σ_{c∈{L*,a*,b*}} Σ_k |CDF^pred_c(k) - CDF^tgt_c(k)|
+Implementa la Wasserstein-1 distance (Earth Mover's Distance) tra
+istogrammi di colore soft (differenziabili via kernel gaussiano) calcolati
+separatamente sui tre canali CIE L*a*b*.
 
-Proprietà: invariante a permutazioni spaziali dei pixel
-→ complementare a L_ΔE (pixel-wise).
+Riferimento tesi: §6.5.2
+Formula: L_hist = (1/3) Σ_c Σ_k |CDF^pred_c(k) - CDF^tgt_c(k)|
 
-Il soft histogram usa kernel gaussiani differenziabili.
+Proprietà chiave:
+    - Invariante alla posizione spaziale dei pixel (cattura distribuzione globale)
+    - Complementare a L_ΔE che è pixel-wise
+    - Differenziabile grazie al kernel gaussiano soft invece dell'assegnamento hard
+    - EMD ≡ norma L1 tra CDF per distribuzioni 1D (formula di Vallender)
 """
 
 import torch
@@ -20,101 +26,134 @@ EPS = 1e-8
 
 
 def soft_histogram(
-    img_channel: torch.Tensor,
-    bins: int = 64,
-    value_range: tuple = (-128.0, 128.0),
-    sigma_bin: float = None,
+    img_lab_channel: torch.Tensor,
+    n_bins: int,
+    val_min: float,
+    val_max: float,
+    sigma_factor: float = 0.5,
 ) -> torch.Tensor:
     """
-    Calcola l'istogramma soft (differenziabile) per un singolo canale.
+    Calcola un istogramma soft differenziabile per un singolo canale Lab.
 
-    h(k) = (1/N) Σ_i exp(-(x_i - μ_k)² / (2σ²))
+    Ogni pixel contribuisce a tutti i bin con peso gaussiano proporzionale
+    alla vicinanza al centro del bin. L'output è normalizzato a distribuzione
+    di probabilità (somma = 1).
 
     Args:
-        img_channel: (B, H, W) — valori di un canale.
-        bins:        Numero di bin.
-        value_range: (min_val, max_val) dell'asse dei valori.
-        sigma_bin:   Larghezza gaussiana. Default: (range/bins) * 0.5.
+        img_lab_channel: Tensore float32 shape (B, H, W), valori nel range
+                         [val_min, val_max].
+        n_bins:          Numero di bin (default 64 in ColorHistogramLoss).
+        val_min:         Valore minimo del range del canale.
+        val_max:         Valore massimo del range del canale.
+        sigma_factor:    Larghezza del kernel come frazione del passo bin.
+                         sigma = sigma_factor * (val_max - val_min) / n_bins.
+                         Default 0.5 → overlap controllato tra bin adiacenti.
 
     Returns:
-        h: (B, bins) — istogramma normalizzato (somma a 1 per batch elem).
+        Tensore float32 shape (B, n_bins), distribuzione di probabilità
+        con somma = 1 lungo la dimensione dei bin.
     """
-    B = img_channel.shape[0]
-    v_min, v_max = value_range
+    
+    B, H, W = img_lab_channel.shape
+    N = H * W
 
-    # Centri dei bin uniformemente spaziati
-    centers = torch.linspace(v_min, v_max, bins,
-                              dtype=img_channel.dtype,
-                              device=img_channel.device)  # (bins,)
+    # Centri dei bin uniformemente distribuiti in [val_min, val_max]
+    bin_step = (val_max - val_min) / n_bins
+    # Centri: val_min + (k + 0.5) * bin_step  per k=0,...,n_bins-1
+    centers = torch.linspace(
+        val_min + 0.5 * bin_step,
+        val_max - 0.5 * bin_step,
+        n_bins,
+        dtype=img_lab_channel.dtype,
+        device=img_lab_channel.device,
+    )  # (n_bins,)
 
-    if sigma_bin is None:
-        sigma_bin = (v_max - v_min) / (2.0 * bins)
+    sigma = sigma_factor * bin_step + EPS
 
-    # Flatten spaziale: (B, N) dove N = H*W
-    x = img_channel.flatten(1)  # (B, N)
+    # Flatten pixel: (B, N)
+    pixels = img_lab_channel.reshape(B, N)  # (B, N)
 
-    # Distanza da ogni pixel a ogni bin: (B, N, bins)
-    diff = x.unsqueeze(-1) - centers.unsqueeze(0).unsqueeze(0)
-    weights = torch.exp(-diff ** 2 / (2.0 * sigma_bin ** 2))  # (B, N, bins)
+    # Broadcasting: (B, N, 1) - (1, 1, n_bins) → (B, N, n_bins)
+    diff = pixels.unsqueeze(-1) - centers.unsqueeze(0).unsqueeze(0)
+    weights = torch.exp(-0.5 * (diff / sigma) ** 2)  # (B, N, n_bins)
 
-    # Somma su pixel → (B, bins)
-    h = weights.sum(dim=1)
+    # Somma sui pixel → (B, n_bins)
+    hist = weights.sum(dim=1)
 
     # Normalizza a distribuzione di probabilità
-    h = h / (h.sum(dim=1, keepdim=True) + EPS)
+    hist = hist / (hist.sum(dim=-1, keepdim=True) + EPS)
 
-    return h  # (B, bins)
+    return hist
 
 
 def histogram_emd(
-    h_pred: torch.Tensor,
-    h_tgt: torch.Tensor,
+    hist1: torch.Tensor,
+    hist2: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Earth Mover's Distance (Wasserstein-1) tra due istogrammi 1D.
+    Earth Mover's Distance (Wasserstein-1) tra due istogrammi 1D discreti.
 
-    EMD(h1, h2) = Σ_k |CDF1(k) - CDF2(k)|
+    Per distribuzioni 1D: EMD = Σ_k |CDF1(k) - CDF2(k)|
+    (formula di Vallender, invariante alla scala dei bin).
 
     Args:
-        h_pred: (B, bins) — istogramma predetto (normalizzato).
-        h_tgt:  (B, bins) — istogramma target (normalizzato).
+        hist1, hist2: Tensori float32 shape (B, n_bins), distribuzioni
+                      di probabilità (somma = 1 per campione).
 
     Returns:
-        (B,) — EMD per elemento del batch.
+        Tensore float32 shape (B,), EMD per campione del batch.
     """
-    cdf_pred = torch.cumsum(h_pred, dim=1)  # (B, bins)
-    cdf_tgt  = torch.cumsum(h_tgt,  dim=1)  # (B, bins)
-    return torch.abs(cdf_pred - cdf_tgt).sum(dim=1)  # (B,)
-
-
-# Ranges per i canali Lab
-_LAB_RANGES = {
-    0: (0.0,    100.0),   # L*
-    1: (-128.0, 127.0),   # a*
-    2: (-128.0, 127.0),   # b*
-}
+    cdf1 = torch.cumsum(hist1, dim=-1)  # (B, n_bins)
+    cdf2 = torch.cumsum(hist2, dim=-1)
+    return torch.abs(cdf1 - cdf2).sum(dim=-1)  # (B,)
 
 
 class ColorHistogramLoss(nn.Module):
     """
-    Loss basata su Earth Mover's Distance tra istogrammi Lab.
+    Loss basata sulla distribuzione globale dei colori in spazio CIE Lab.
 
-    L_hist = (1/3) Σ_{c∈{L*,a*,b*}} EMD(h^pred_c, h^tgt_c)
+    Calcola la Wasserstein-1 distance tra gli istogrammi soft dei tre canali
+    L*, a*, b* dell'immagine predetta e del target, mediata sul batch.
 
-    Args:
-        bins:      Numero di bin per canale (default 64).
-        sigma_bin: Larghezza gaussiana soft histogram.
-                   None → calcolata automaticamente come range/(2*bins).
+    Parametri degli istogrammi (§6.5.2):
+        - n_bins = 64
+        - sigma_factor = 0.5 (metà passo bin → overlap controllato)
+        - Range per canale: L* ∈ [0, 100], a* ∈ [-128, 127], b* ∈ [-128, 127]
+
+    Example:
+        >>> loss_fn = ColorHistogramLoss()
+        >>> pred = torch.rand(2, 3, 384, 512)
+        >>> tgt  = torch.rand(2, 3, 384, 512)
+        >>> loss = loss_fn(pred, tgt)   # scalar tensor
     """
+
+    # Range dei canali CIE Lab per definire i centri dei bin
+    _LAB_RANGES = [
+        (0.0,    100.0),   # L*
+        (-128.0, 127.0),   # a*
+        (-128.0, 127.0),   # b*
+    ]
 
     def __init__(
         self,
-        bins: int = 64,
-        sigma_bin: float = None,
-    ) -> None:
+        n_bins: int = 64,
+        sigma_factor: float = 0.5,
+    ):
+        """
+        Args:
+            n_bins:       Numero di bin per canale. Default 64.
+            sigma_factor: Larghezza del kernel gaussiano come frazione
+                          del passo bin. Default 0.5.
+        """
         super().__init__()
-        self.bins      = bins
-        self.sigma_bin = sigma_bin
+        self.n_bins       = n_bins
+        self.sigma_factor = sigma_factor
+
+    def _to_lab(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Converti (B, 3, H, W) sRGB [0,1] → (B, H, W, 3) Lab float32.
+        """
+        return rgb_to_lab(img.float().permute(0, 2, 3, 1))  # (B, H, W, 3)
 
     def forward(
         self,
@@ -123,35 +162,30 @@ class ColorHistogramLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            pred:   (B, 3, H, W) in [0,1] — sRGB predetto.
-            target: (B, 3, H, W) in [0,1] — sRGB target.
+            pred:   sRGB (B, 3, H, W) in [0,1].
+            target: sRGB (B, 3, H, W) in [0,1].
 
         Returns:
-            Scalare — EMD medio sui 3 canali Lab e sul batch.
+            Scalare: media dell'EMD sui tre canali e sul batch.
         """
-        # Converti in Lab: (B, H, W, 3)
-        pred_lab   = rgb_to_lab(pred.permute(0, 2, 3, 1))
-        target_lab = rgb_to_lab(target.permute(0, 2, 3, 1))
+        lab_pred = self._to_lab(pred)    # (B, H, W, 3)
+        lab_tgt  = self._to_lab(target)
 
-        total_emd = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        total_emd = torch.zeros(1, device=pred.device, dtype=torch.float32)
 
-        for c in range(3):
-            vrange = _LAB_RANGES[c]
+        for c, (val_min, val_max) in enumerate(self._LAB_RANGES):
+            ch_pred = lab_pred[..., c]   # (B, H, W)
+            ch_tgt  = lab_tgt[..., c]
 
-            # Estrai canale c: (B, H, W)
-            pred_ch   = pred_lab[..., c]
-            target_ch = target_lab[..., c]
-
-            # Calcola soft histogram
-            h_pred = soft_histogram(
-                pred_ch, self.bins, vrange, self.sigma_bin
-            )
-            h_tgt = soft_histogram(
-                target_ch, self.bins, vrange, self.sigma_bin
+            hist_pred = soft_histogram(
+                ch_pred, self.n_bins, val_min, val_max, self.sigma_factor
+            )  # (B, n_bins)
+            hist_tgt = soft_histogram(
+                ch_tgt, self.n_bins, val_min, val_max, self.sigma_factor
             )
 
-            # EMD
-            emd = histogram_emd(h_pred, h_tgt)  # (B,)
+            emd = histogram_emd(hist_pred, hist_tgt)  # (B,)
             total_emd = total_emd + emd.mean()
 
+        # Media sui 3 canali
         return total_emd / 3.0

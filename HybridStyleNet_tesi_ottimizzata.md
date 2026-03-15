@@ -66,18 +66,18 @@ Input: I^src ∈ [0,1]^{H×W×3}  (risoluzione variabile)
         │  P3: [B, 48, H₃, W₃]
         ▼
 ┌───────────────────────────────────────────────────────┐
-│  SWIN TRANSFORMER stage 4-5 (con RoPE)  (fp16)        │
+│  SWIN TRANSFORMER stage 4-5  (fp16)                   │
 │                                                       │
 │  Stage 4: Window attention M×M + Shifted windows      │
-│           → [B, 96,  H₄, W₄]  ← P4                   │
+│           → [B, 96,  H₄, W₄]  ← P4                    │
 │                                                       │
 │  Stage 5: Window attention M×M + Shifted windows      │
-│           → [B, 192, H₅, W₅]  ← P5                   │
+│           → [B, 192, H₅, W₅]  ← P5                    │
 │                                                       │
-│  T(H,W) = H₅·W₅ token (varia con la risoluzione)     │
-│  RoPE → generalizza a qualsiasi (H,W) senza retraining│
+│  T(H,W) = H₅·W₅ token (varia con la risoluzione)      │
+│  RPB → position bias relativo dentro ogni finestra    │
 │                                                       │
-│  Ogni token in P5 → regione (H/H₅)×(W/W₅) px         │
+│  Ogni token in P5 → regione (H/H₅)×(W/W₅) px          │
 └───────────────────────────────────────────────────────┘
         │
         ▼
@@ -172,7 +172,7 @@ Le funzioni di attivazione sono: **Hard-Swish** $\delta_{hs}(x) = x \cdot \text{
 
 ---
 
-##### **2. Swin Transformer Stage 4-5 con RoPE**
+##### **2. Swin Transformer Stage 4-5 con RPB**
 
 **Motivazione e complessità computazionale.** Un Vision Transformer standard con patch size $p \times p$ su un'immagine $H \times W$ produce $T = \frac{H \cdot W}{p^2}$ token. Con $p = 16$ la complessità della self-attention globale è:
 
@@ -204,23 +204,42 @@ La scelta di $h = 4$ teste (ridotta rispetto alle 8 del progetto originale) è m
 
 **Shifted Window (SW-MSA).** Per garantire connettività tra finestre adiacenti, i layer alternano W-MSA con SW-MSA, dove le finestre sono traslate di $(\lfloor M/2 \rfloor, \lfloor M/2 \rfloor)$ token. Con $L$ layer Swin e finestre $M \times M$, ogni token ha ricevuto informazione da regioni distanti fino a $\lfloor L/2 \rfloor \cdot M$ token in ogni direzione — sufficiente per catturare dipendenze globali a qualsiasi risoluzione.
 
-**Rotary Position Embedding (RoPE).** Il positional encoding assoluto standard aggiunge un vettore $\mathbf{p}_m \in \mathbb{R}^d$ al token in posizione $m$, appreso durante il training. Questo crea un problema di **distribution shift**: il modello viene addestrato su crop $512 \times 384$ per efficienza di memoria, ma all'inferenza opera su risoluzioni arbitrariamente maggiori. Le posizioni viste all'inferenza sono al di fuori del range visto al training.
+**Relative Position Bias (RPB).** Lo Swin Transformer originale usa un bias
+posizionale relativo $\mathbf{B}_k \in \mathbb{R}^{M^2 \times M^2}$ per testa,
+già incluso nella formula W-MSA:
 
-RoPE risolve questo codificando la posizione come **rotazione** nel piano complesso. Per la posizione $m$, il vettore $\mathbf{q}_m$ viene trasformato come:
+$$\text{head}_k = \text{Softmax}\!\left(\frac{\mathbf{Q}_k \mathbf{K}_k^T}
+{\sqrt{d/4}} + \mathbf{B}_k\right) \mathbf{V}_k$$
 
-$$f(\mathbf{q}, m)_j = q_j e^{im\theta_j}, \quad \theta_j = \frac{1}{10000^{2j/d}}$$
+$\mathbf{B}_k$ è indicizzato dalla differenza di posizione $(i-i', j-j')$ tra
+due token all'interno della stessa finestra $M \times M$. Con $M = 7$, le
+differenze relative appartengono all'intervallo $[-(M-1), +(M-1)] = [-6, +6]$
+in entrambe le dimensioni — un totale di $(2M-1)^2 = 169$ valori distinti,
+memorizzati in una tabella $\hat{\mathbf{B}}_k \in \mathbb{R}^{(2M-1)\times(2M-1)}$
+appresa durante il training.
 
-Il prodotto scalare tra query alla posizione $m$ e key alla posizione $n$ diventa:
+**Perché RPB è sufficiente e RoPE non è necessario.** La motivazione originale
+per RoPE era prevenire il distribution shift posizionale tra training (crop
+$512 \times 384$) e inferenza (risoluzione piena). Questo problema esiste nei
+Vision Transformer puri con attenzione globale, dove la posizione assoluta dei
+token varia con la risoluzione. Nel Swin Transformer con attenzione locale a
+finestre fisse, il problema non si pone: RPB opera all'interno di finestre di
+dimensione fissa $M \times M = 7 \times 7$, e le differenze relative
+$[-(M-1), +(M-1)]$ sono le stesse indipendentemente dalla risoluzione
+dell'immagine. Un'immagine $512 \times 384$ e un'immagine $3000 \times 2000$
+producono esattamente le stesse differenze relative intra-finestra — nessun
+distribution shift posizionale è presente.f
 
-$$f(\mathbf{q}, m)^T f(\mathbf{k}, n) = \sum_{j=1}^{d/2} \text{Re}\!\left[(q_{2j-1} + iq_{2j})(k_{2j-1} - ik_{2j}) e^{i(m-n)\theta_j}\right] = g(\mathbf{q}, \mathbf{k}, m-n)$$
+L'uso di RPB standard semplifica inoltre l'implementazione: si usa direttamente
+`timm.models.swin_transformer` senza modifiche al meccanismo di attenzione,
+eliminando una fonte di potenziali bug numerici.
 
-**Proprietà chiave**: il prodotto dipende solo dalla differenza $m-n$ (distanza relativa), non dai valori assoluti $m$ e $n$. Di conseguenza il modello generalizza immediatamente a qualsiasi risoluzione senza distribution shift posizionale.
+Di conseguenza il modello generalizza immediatamente a qualsiasi risoluzione senza distribution shift posizionale.
 
 Le due trasformazioni Swin producono feature maps a dimensioni simboliche:
 
-$$P_4 = \text{SwinStage4}(P_3;\,\text{RoPE}) \in \mathbb{R}^{B \times 96 \times H_4 \times W_4}$$
-
-$$P_5 = \text{SwinStage5}(P_4;\,\text{RoPE}) \in \mathbb{R}^{B \times 192 \times H_5 \times W_5}$$
+$$P_4 = \text{SwinStage4}(P_3;\,\text{RPB}) \in \mathbb{R}^{B \times 96 \times H_4 \times W_4}$$
+$$P_5 = \text{SwinStage5}(P_4;\,\text{RPB}) \in \mathbb{R}^{B \times 192 \times H_5 \times W_5}$$
 
 Ogni token in $P_5$ rappresenta una regione $(H/H_5) \times (W/W_5)$ pixel dell'immagine originale e, dopo i layer Swin, porta informazione contestuale dell'intera scena. Tutte le operazioni di attenzione vengono eseguite in fp16 con accumulazione in fp32 per la softmax, seguendo le best practice di stabilità numerica con mixed precision.
 
@@ -290,53 +309,118 @@ Il tensore `context` viene risagomato a mappa spaziale $\mathbb{R}^{B \times 192
 
 ---
 
+
 ##### **5. AdaIN Conditioning nel Global Branch**
 
-L'Adaptive Instance Normalization (AdaIN) è il meccanismo che traduce il vettore di stile $\mathbf{s} \in \mathbb{R}^{256}$ in una modulazione delle feature maps di $P_5$.
+L'Adaptive Instance Normalization (AdaIN) è il meccanismo che traduce il vettore di stile
+$\mathbf{s} \in \mathbb{R}^{256}$ in una modulazione delle feature maps di $P_5$.
 
-Sia $\mathbf{h} \in \mathbb{R}^{C \times H' \times W'}$ una feature map con $C$ canali. Per il canale $c$, i parametri di normalizzazione dipendenti dallo stile sono:
+Sia $\mathbf{h} \in \mathbb{R}^{C \times H' \times W'}$ una feature map con $C$ canali.
+Per il canale $c$, i parametri di normalizzazione dipendenti dallo stile sono:
 
-$$\gamma_c(\mathbf{s}) = \mathbf{w}_{\gamma,c}^T \mathbf{s} + b_{\gamma,c}, \qquad \beta_c(\mathbf{s}) = \mathbf{w}_{\beta,c}^T \mathbf{s} + b_{\beta,c}$$
+$$\gamma_c(\mathbf{s}) = \mathbf{w}_{\gamma,c}^T \mathbf{s} + b_{\gamma,c}, \qquad
+\beta_c(\mathbf{s}) = \mathbf{w}_{\beta,c}^T \mathbf{s} + b_{\beta,c}$$
 
 con $\mathbf{w}_{\gamma,c}, \mathbf{w}_{\beta,c} \in \mathbb{R}^{256}$ appresi. L'operazione AdaIN è:
 
-$$\text{AdaIN}(\mathbf{h}, \mathbf{s})_c = \gamma_c(\mathbf{s}) \cdot \frac{\mathbf{h}_c - \mu_c(\mathbf{h})}{\sigma_c(\mathbf{h}) + \epsilon} + \beta_c(\mathbf{s})$$
+$$\text{AdaIN}(\mathbf{h}, \mathbf{s})_c = \gamma_c(\mathbf{s}) \cdot
+\frac{\mathbf{h}_c - \mu_c(\mathbf{h})}{\sigma_c(\mathbf{h}) + \epsilon} + \beta_c(\mathbf{s})$$
 
-dove $\mu_c(\mathbf{h}) = \frac{1}{H'W'}\sum_{i,j} h_c(i,j)$ e $\sigma_c(\mathbf{h}) = \sqrt{\frac{1}{H'W'}\sum_{i,j}(h_c(i,j)-\mu_c)^2 + \epsilon}$ sono media e deviazione standard della feature map nel canale $c$.
+dove $\mu_c(\mathbf{h}) = \frac{1}{H'W'}\sum_{i,j} h_c(i,j)$ e
+$\sigma_c(\mathbf{h}) = \sqrt{\frac{1}{H'W'}\sum_{i,j}(h_c(i,j)-\mu_c)^2 + \epsilon}$
+sono media e deviazione standard della feature map nel canale $c$.
 
-**Interpretazione:** AdaIN rimuove le statistiche del primo e secondo ordine della feature (normalizza a media 0, varianza 1) e le rimpiazza con quelle dettate dallo stile $\mathbf{s}$. Huang & Bethge (2017) dimostrano che le statistiche di secondo ordine (covarianza) delle feature maps di una CNN encodano lo stile visivo: manipolandole si trasferisce lo stile mantenendo la struttura spaziale intatta.
+**Interpretazione:** AdaIN rimuove le statistiche del primo e secondo ordine della feature
+(normalizza a media 0, varianza 1) e le rimpiazza con quelle dettate dallo stile $\mathbf{s}$.
+Huang & Bethge (2017) dimostrano che le statistiche di secondo ordine (covarianza) delle
+feature maps di una CNN encodano lo stile visivo: manipolandole si trasferisce lo stile
+mantenendo la struttura spaziale intatta.
 
-Le feature modulate $\tilde{P}_5 = \text{AdaIN}(P_5, \mathbf{s}) \in \mathbb{R}^{B \times 192 \times H_5 \times W_5}$ vengono poi elaborate dal Global Branch:
+Le feature modulate $\tilde{P}_5 = \text{AdaIN}(P_5, \mathbf{s}) \in
+\mathbb{R}^{B \times 192 \times H_5 \times W_5}$ vengono poi elaborate dal Global Branch:
 
-$$\mathbf{f}_{global} = \text{GAP}(\tilde{P}_5) \in \mathbb{R}^{B \times 192} \quad \text{(Global Average Pool, elimina le dimensioni spaziali)}$$
+$$\mathbf{f}_{global} = \text{GAP}(\tilde{P}_5) \in \mathbb{R}^{B \times 192}$$
 
-$$G_{global} = \text{reshape}\!\left(\mathbf{W}_{gb,2} \cdot \delta\!\left(\mathbf{W}_{gb,1} \cdot \mathbf{f}_{global}\right)\right) \in \mathbb{R}^{B \times 12 \times 8 \times 8 \times L_b}$$
+$$G_{global} = \text{reshape}\!\left(\mathbf{W}_{gb,2} \cdot
+\delta\!\left(\mathbf{W}_{gb,1} \cdot \mathbf{f}_{global}\right)\right)
+\in \mathbb{R}^{B \times 12 \times 8 \times 8 \times L_b}$$
 
-con $\mathbf{W}_{gb,1} \in \mathbb{R}^{256 \times 192},\ \mathbf{W}_{gb,2} \in \mathbb{R}^{(12 \cdot 8^2 \cdot L_b) \times 256}$ e $\delta$ ReLU. La grid globale ha risoluzione spaziale **fissa** $8 \times 8$ indipendentemente da $(H, W)$: il GAP ha già eliminato le dimensioni spaziali prima dei layer FC.
+con $\mathbf{W}_{gb,1} \in \mathbb{R}^{256 \times 192},\
+\mathbf{W}_{gb,2} \in \mathbb{R}^{(12 \cdot 8^2 \cdot L_b) \times 256}$ e $\delta$ ReLU.
+
+**Inizializzazione all'identità della bilateral grid.** Un'inizializzazione casuale dei
+pesi $\mathbf{W}_{gb,2}$ produce coefficienti affini $\mathbf{A}_{ij}$ lontani dalla
+trasformazione identità nelle prime epoche, costringendo il training a spendere gradiente
+prezioso a correggere trasformazioni completamente errate prima di poter apprendere lo stile.
+Per evitare questo, il layer finale $\mathbf{W}_{gb,2}$ viene inizializzato in modo che
+il bias produca i coefficienti della trasformazione identità:
+```python
+nn.init.zeros_(global_branch.last_layer.weight)
+identity_bias = torch.tensor(
+    [1,0,0, 0,1,0, 0,0,1, 0,0,0], dtype=torch.float32
+)
+global_branch.last_layer.bias.data = identity_bias.repeat(8 * 8 * L_b)
+```
+
+Questa inizializzazione garantisce che all'epoca 0 il modello produca
+$I^{pred} \approx I^{src}$, da cui il training parte in modo stabile verso lo
+stile target. Il vantaggio empirico atteso è una riduzione di 2–3 punti di ΔE
+nelle prime 5 epoche rispetto all'inizializzazione casuale.
 
 ---
 
 ##### **6. SPADE Conditioning nel Local Branch**
 
-SPADE (Park et al., CVPR 2019) estende AdaIN con conditioning **spazialmente variabile**: i parametri $\gamma$ e $\beta$ sono funzioni della posizione $(x,y)$, non costanti sul canale.
+SPADE (Park et al., CVPR 2019) estende AdaIN con conditioning **spazialmente variabile**:
+i parametri $\gamma$ e $\beta$ sono funzioni della posizione $(x,y)$, non costanti sul canale.
 
-Sia $\mathbf{m} \in \mathbb{R}^{C_m \times H_m \times W_m}$ la mappa di conditioning (il tensore `context` risagomato), con $C_m = 128$ canali (ridotti rispetto alla versione originale per contenere il consumo di memoria in fp16). I parametri SPADE alla posizione $(x,y)$ sono:
+Sia $\mathbf{m} \in \mathbb{R}^{C_m \times H_m \times W_m}$ la mappa di conditioning
+(il tensore `context` risagomato), con $C_m = 128$ canali. I parametri SPADE alla
+posizione $(x,y)$ sono:
 
-$$\gamma_c(x,y) = \left[\text{Conv}_\gamma(\mathbf{m})\right]_{c,x,y}, \qquad \beta_c(x,y) = \left[\text{Conv}_\beta(\mathbf{m})\right]_{c,x,y}$$
+$$\gamma_c(x,y) = \left[\text{Conv}_\gamma(\mathbf{m})\right]_{c,x,y}, \qquad
+\beta_c(x,y) = \left[\text{Conv}_\beta(\mathbf{m})\right]_{c,x,y}$$
 
-dove $\text{Conv}_\gamma, \text{Conv}_\beta: \mathbb{R}^{128 \times H_m \times W_m} \to \mathbb{R}^{C \times H' \times W'}$ sono convoluzioni $3 \times 3$. L'operazione è:
+dove $\text{Conv}_\gamma, \text{Conv}_\beta: \mathbb{R}^{128 \times H_m \times W_m}
+\to \mathbb{R}^{C \times H' \times W'}$ sono convoluzioni $3 \times 3$. L'operazione è:
 
-$$\text{SPADE}(\mathbf{h}, \mathbf{m})_{c,x,y} = \gamma_c(x,y) \cdot \frac{h_{c,x,y} - \mu_c(\mathbf{h})}{\sigma_c(\mathbf{h}) + \epsilon} + \beta_c(x,y)$$
+$$\text{SPADE}(\mathbf{h}, \mathbf{m})_{c,x,y} = \gamma_c(x,y) \cdot
+\frac{h_{c,x,y} - \mu_c(\mathbf{h})}{\sigma_c(\mathbf{h}) + \epsilon} + \beta_c(x,y)$$
 
-**Differenza fondamentale rispetto ad AdaIN:** In AdaIN, $\gamma_c$ e $\beta_c$ sono scalari (costanti su tutto il piano spaziale). In SPADE sono mappe spaziali: ogni pixel riceve un conditioning diverso. Questo permette al Local Branch di applicare trasformazioni cromatiche diverse su regioni diverse dell'immagine — esattamente come un fotografo applica skin tone warm sui volti e desaturation sul cielo nella stessa immagine. La riduzione a $C_m = 128$ canali riduce il costo delle convoluzioni SPADE del 75% rispetto a $C_m = 256$, con impatto trascurabile sulla qualità grazie alla compressione dell'informazione già operata dal cross-attention.
+**Differenza fondamentale rispetto ad AdaIN:** In AdaIN, $\gamma_c$ e $\beta_c$ sono
+scalari (costanti su tutto il piano spaziale). In SPADE sono mappe spaziali: ogni pixel
+riceve un conditioning diverso. Questo permette al Local Branch di applicare trasformazioni
+cromatiche diverse su regioni diverse dell'immagine.
 
-Il Local Branch processa le feature di $P_4$ e $P_3$ con blocchi SPADE-ResBlock e upsampling, producendo la bilateral grid di compromesso a risoluzione $16 \times 16$:
+**Inizializzazione all'identità della bilateral grid locale.** Analogamente al Global
+Branch, il layer finale del Local Branch viene inizializzato per produrre la trasformazione
+identità su ogni cella della griglia $16 \times 16$:
+```python
+nn.init.zeros_(local_branch.last_conv.weight)
+identity_bias = torch.tensor(
+    [1,0,0, 0,1,0, 0,0,1, 0,0,0], dtype=torch.float32
+)
+local_branch.last_conv.bias.data = identity_bias.repeat(16 * 16 * L_b)
+```
 
-$$\mathbf{x}_4 = \text{SPADEResBlock}(P_4,\ \mathbf{m}_{H_4}) \in \mathbb{R}^{B \times 96 \times H_4 \times W_4}$$
+Poiché il Local Branch processa feature di media risoluzione prima di un
+`AdaptiveAvgPool` a $(16,16)$, l'inizializzazione all'identità è ancora più
+critica che nel Global Branch: senza di essa, le prime iterazioni producono
+trasformazioni locali erratiche che il training fatica a correggere.
 
-$$\mathbf{x}_3 = \text{SPADEResBlock}(\text{Up}(\mathbf{x}_4) + P_3,\ \mathbf{m}_{H_3}) \in \mathbb{R}^{B \times 96 \times H_3 \times W_3}$$
+Il Local Branch processa le feature di $P_4$ e $P_3$ con blocchi SPADE-ResBlock
+e upsampling, producendo la bilateral grid di compromesso a risoluzione $16 \times 16$:
 
-$$G_{local} = \text{reshape}\!\left(\text{Conv}_{1 \times 1}\!\left(\text{AdaptiveAvgPool}(\mathbf{x}_3,\; (16,16))\right)\right) \in \mathbb{R}^{B \times 12 \times 16 \times 16 \times L_b}$$
+$$\mathbf{x}_4 = \text{SPADEResBlock}(P_4,\ \mathbf{m}_{H_4})
+\in \mathbb{R}^{B \times 96 \times H_4 \times W_4}$$
+
+$$\mathbf{x}_3 = \text{SPADEResBlock}(\text{Up}(\mathbf{x}_4) + P_3,\ \mathbf{m}_{H_3})
+\in \mathbb{R}^{B \times 96 \times H_3 \times W_3}$$
+
+$$G_{local} = \text{reshape}\!\left(\text{Conv}_{1 \times 1}\!\left(
+\text{AdaptiveAvgPool}(\mathbf{x}_3,\; (16,16))\right)\right)
+\in \mathbb{R}^{B \times 12 \times 16 \times 16 \times L_b}$$
+
 
 dove $\mathbf{m}_{H_4}$ e $\mathbf{m}_{H_3}$ sono il tensore `context` (proiettato a 128 canali con $\text{Conv}_{1\times1}$) interpolato bilinearmente alle rispettive risoluzioni $(H_4, W_4)$ e $(H_3, W_3)$, e Up denota upsampling bilineare $\times 2$. L'`AdaptiveAvgPool` riduce qualsiasi tensore di dimensioni spaziali $(H_3, W_3)$ a $(16, 16)$ — la grid locale ha risoluzione fissa $16 \times 16$ indipendentemente dalla risoluzione dell'input.
 
@@ -366,17 +450,63 @@ La skip connection permette al gradiente di fluire direttamente dall'output all'
 
 ##### **7. Confidence Mask**
 
-La Confidence Mask $\alpha \in [0,1]^{H \times W}$ determina pixel per pixel quanto peso assegnare al ramo locale rispetto al ramo globale. Viene predetta da una rete leggera che processa le feature di media risoluzione:
+La Confidence Mask $\alpha \in [0,1]^{H \times W}$ determina pixel per pixel quanto peso
+assegnare al ramo locale rispetto al ramo globale. Rispetto alla formulazione originale,
+l'architettura è estesa per condizionarsi anche sulla **divergenza spaziale tra le due
+trasformazioni**: nelle zone dove $I_{local}$ e $I_{global}$ differiscono significativamente,
+la mask deve prendere una decisione netta (vicina a 0 o a 1) invece di fare media,
+che produrrebbe aloni ai bordi.
 
-$$\tilde{P}_4 = \text{BilinearUp}(P_4,\; (H_3, W_3)) \in \mathbb{R}^{B \times 96 \times H_3 \times W_3}$$
+**Calcolo della mappa di divergenza.** Dopo il bilateral slicing (Step 6 e 7 del forward
+pass), si calcola la differenza pixel-wise in valore assoluto tra le due immagini trasformate:
 
-$$\mathbf{z}_{mask} = \delta\!\left(\text{Conv}_{3\times3}([\tilde{P}_4;\ P_3])\right) \in \mathbb{R}^{B \times 64 \times H_3 \times W_3}$$
+$$\mathbf{D}(i,j) = \left|I_{local}(i,j) - I_{global}(i,j)\right|
+\in \mathbb{R}^{B \times 3 \times H \times W}$$
 
-$$\alpha_{low} = \sigma\!\left(\text{Conv}_{1\times1}(\mathbf{z}_{mask})\right) \in [0,1]^{B \times 1 \times H_3 \times W_3}$$
+La mappa di divergenza viene downsamplata alla risoluzione di $P_3$ per essere concatenata
+con le feature dell'encoder:
 
-$$\alpha = \text{BilinearUp}(\alpha_{low},\; (H, W)) \in [0,1]^{B \times 1 \times H \times W}$$
+$$\mathbf{D}_3 = \text{AdaptiveAvgPool}(\mathbf{D},\; (H_3, W_3))
+\in \mathbb{R}^{B \times 3 \times H_3 \times W_3}$$
 
-dove $[\cdot;\cdot]$ denota concatenazione lungo i canali e $\sigma$ è la funzione sigmoide. Il upsampling bilineare finale garantisce che la mappa sia smooth — le transizioni tra zone a diverso conditioning sono graduali, evitando bordi artefattuali.
+**Architettura della MaskNet estesa:**
+
+$$\tilde{P}_4 = \text{BilinearUp}(P_4,\; (H_3, W_3))
+\in \mathbb{R}^{B \times 96 \times H_3 \times W_3}$$
+
+$$\mathbf{z}_{mask} = \delta\!\left(\text{Conv}_{3\times3}
+\left([\tilde{P}_4;\ P_3;\ \mathbf{D}_3]\right)\right)
+\in \mathbb{R}^{B \times 64 \times H_3 \times W_3}$$
+
+$$\alpha_{low} = \sigma\!\left(\text{Conv}_{1\times1}(\mathbf{z}_{mask})\right)
+\in [0,1]^{B \times 1 \times H_3 \times W_3}$$
+
+$$\alpha = \text{BilinearUp}(\alpha_{low},\; (H, W))
+\in [0,1]^{B \times 1 \times H \times W}$$
+
+dove $[\cdot;\cdot;\cdot]$ denota concatenazione lungo i canali. Il canale di input
+della prima convoluzione sale da $96 + 48 = 144$ a $96 + 48 + 3 = 147$.
+
+**Entropy loss per polarizzare la mask.** Per incoraggiare $\alpha$ verso valori estremi
+(0 o 1) invece di rimanere centrata su 0.5 — condizione che produce aloni nel blending —
+si aggiunge un termine di entropia alla loss composita:
+
+$$\mathcal{L}_{entropy} = -\frac{\lambda_e}{HW}\sum_{i,j}
+\left[\alpha_{ij}\log(\alpha_{ij} + \varepsilon) +
+(1-\alpha_{ij})\log(1-\alpha_{ij} + \varepsilon)\right]$$
+
+con $\lambda_e = 0.01$ (costante in tutte le fasi del curriculum) e
+$\varepsilon = 10^{-6}$ per stabilità numerica. Questa loss massimizza la
+certezza della mask: $\mathcal{L}_{entropy}$ è minimizzata quando $\alpha \in \{0, 1\}$
+e massimizzata quando $\alpha = 0.5$.
+
+La loss composita aggiornata è:
+
+$$\boxed{\mathcal{L} = \lambda_{\Delta E}\,\mathcal{L}_{\Delta E} +
+\lambda_{L1Lab}\,\mathcal{L}_{L1Lab} + \lambda_{hist}\,\mathcal{L}_{hist} +
+\lambda_{perc}\,\mathcal{L}_{perc} + \lambda_{chroma}\,\mathcal{L}_{chroma} +
+\lambda_{id}\,\mathcal{L}_{id} + \lambda_{TV}\,\mathcal{L}_{TV} +
+\lambda_{lum}\,\mathcal{L}_{lum} + \lambda_e\,\mathcal{L}_{entropy}}$$
 
 ---
 
@@ -822,7 +952,11 @@ $$\mathbf{R} \xrightarrow{\text{(1) linearize}} R_{norm} \xrightarrow{\text{(2) 
 
 (a) Le **convoluzioni** in MobileNetV3-Small operano con kernel locali: la loro risposta dipende solo dai pattern locali, non dalla risoluzione assoluta.
 
-(b) Il **Swin Transformer con RoPE** codifica solo le distanze relative tra token, non le posizioni assolute. Cambiare la risoluzione dell'input cambia il numero di token $T = H_s W_s / (32^2)$, ma non la semantica delle rappresentazioni.
+(b) Il **Swin Transformer con RPB** codifica le posizioni relative all'interno
+di finestre fisse $M \times M = 7 \times 7$. Le differenze relative appartengono
+sempre a $[-(M-1), +(M-1)]^2$ indipendentemente dalla risoluzione: cambiare la
+risoluzione cambia il numero di finestre e di token $T = H_s W_s / (32^2)$,
+ma non le differenze relative intra-finestra su cui RPB è definito.
 
 (c) La **bilateral grid** è parametrizzata in coordinate normalizzate $x_g(j) = \frac{j}{W-1}(W_g-1)$: la stessa trasformazione cromatica viene applicata alla stessa posizione relativa indipendentemente dalla risoluzione assoluta.
 
@@ -852,15 +986,43 @@ con $\mathbf{A}(x,y,l) \in \mathbb{R}^{3\times 3}$ matrice di trasformazione cro
 
 **Intuizione geometrica.** La grid discretizza lo spazio $(x, y, g)$ dove $x,y$ sono le coordinate spaziali e $g$ è la luminanza del pixel. A ogni punto di questo spazio tridimensionale è associata una trasformazione affine diversa: pixel in posizioni diverse e/o con luminanze diverse ricevono trattamenti cromatici distinti.
 
-#### 6.3.2 Guida di Luminanza e Coordinate nella Grid
+#### 6.3.2 Guida Cromatica e Coordinate nella Grid
 
-Per ogni pixel $(i,j)$ dell'immagine sorgente $I_{src}$, la guida di luminanza è:
+Per ogni pixel $(i,j)$ dell'immagine sorgente $I_{src}$, la guida classica di HDRNet
+usa la sola luminanza $g_{lum}(i,j) = 0.299\,I_R + 0.587\,I_G + 0.114\,I_B$.
+Questa scelta ha un limite per il color grading: due pixel con luminanza identica ma
+colore molto diverso — ad esempio un rosso saturo e un ciano saturo con lo stesso $L^*$ —
+ricevono la stessa trasformazione dalla griglia, che può essere errata per entrambi.
 
-$$g(i,j) = 0.299\, I_R(i,j) + 0.587\, I_G(i,j) + 0.114\, I_B(i,j) \in [0,1]$$
+Per aumentare la discriminabilità cromatica della guida, si sostituisce la guida di
+luminanza pura con una **guida cromatica mista** che incorpora informazione di chroma:
+
+$$g(i,j) = 0.5\cdot L^*(i,j) + 0.25\cdot|a^*(i,j)| + 0.25\cdot|b^*(i,j)|$$
+
+dove $L^*, a^*, b^*$ sono i canali dell'immagine sorgente nello spazio CIE Lab
+(convertita dalla pipeline §6.2). I valori assoluti $|a^*|$ e $|b^*|$ catturano
+l'intensità del colore indipendentemente dalla sua direzione (hue), rendendo la guida
+sensibile alla **saturazione** oltre che alla luminanza. Il valore risultante $g(i,j)$
+viene normalizzato in $[0,1]$ dividendo per il massimo teorico della combinazione
+(circa $0.5 \cdot 100 + 0.25 \cdot 128 + 0.25 \cdot 128 = 114$ per i range Lab standard,
+con clip implicito).
+
+**Proprietà edge-aware estesa.** La guida cromatica mista eredita la proprietà
+edge-aware del bilateral grid (pixel simili ricevono trasformazioni simili) e la estende
+al dominio cromatico: due pixel con lo stesso colore e diversa posizione spaziale ricevono
+trasformazioni simili, anche se la loro luminanza differisce leggermente. Questo è
+particolarmente utile per zone di transizione come i bordi tra skin e sfondo, dove la
+luminanza può essere simile ma il colore è molto diverso.
 
 Le coordinate nella griglia:
 
-$$x_g(j) = \frac{j}{W-1}(W_g - 1) \in [0, W_g-1], \quad y_g(i) = \frac{i}{H-1}(H_g - 1) \in [0, H_g-1], \quad l_g(i,j) = g(i,j)\cdot(L_b - 1) \in [0, L_b-1]$$
+$$x_g(j) = \frac{j}{W-1}(W_g - 1), \quad
+y_g(i) = \frac{i}{H-1}(H_g - 1), \quad
+l_g(i,j) = g(i,j)\cdot(L_b - 1)$$
+
+La conversione Lab per il calcolo di $g$ viene eseguita in fp32 e il risultato
+$g(i,j) \in [0,1]$ viene poi usato in fp16 per il trilinear slicing.
+
 
 #### 6.3.3 Interpolazione Trilineare
 
@@ -911,13 +1073,14 @@ $$P_3 = \mathcal{F}^{(3)} \circ \mathcal{F}^{(2)} \circ \mathcal{F}^{(1)}(I^{src
 
 Ogni stage $\mathcal{F}^{(k)}$ è una composizione di blocchi bneck con stride 2 (depthwise separable conv + SE + BN + Hard-Swish), producendo uno stride cumulativo $2^k$. Il receptive field effettivo al termine dello stage 3 è $\approx 20$–$30$ pixel. **Gradient checkpointing** attivo: i tensori intermedi vengono ricalcolati durante il backward pass.
 
-#### Step 2 — Swin Transformer Stage 4–5 con RoPE (fp16)
+#### Step 2 — Swin Transformer Stage 4–5 con RPB (fp16)
 
-$$P_4 = \text{SwinStage}_4(P_3;\, \text{RoPE}) \in \mathbb{R}^{B \times 96 \times H_4 \times W_4}\ \text{(fp16)}$$
+$$P_4 = \text{SwinStage}_4(P_3;\, \text{RPB}) \in \mathbb{R}^{B \times 96 \times H_4 \times W_4}$$
+$$P_5 = \text{SwinStage}_5(P_4;\, \text{RPB}) \in \mathbb{R}^{B \times 192 \times H_5 \times W_5}$$
 
-$$P_5 = \text{SwinStage}_5(P_4;\, \text{RoPE}) \in \mathbb{R}^{B \times 192 \times H_5 \times W_5}\ \text{(fp16)}$$
-
-Ogni stage Swin applica W-MSA alternato a SW-MSA con finestre $M \times M = 7 \times 7$ e **4 teste di attenzione**. La complessità è $O(T(H,W) \cdot M^2 \cdot d)$ — lineare in $(H,W)$. Con RoPE il prodotto $\mathbf{q}_m^T \mathbf{k}_n = g(\mathbf{q}, \mathbf{k}, m-n)$ dipende solo dalla distanza relativa: il modello generalizza a qualsiasi risoluzione senza riaddestrare. Zero-padding simmetrico garantisce finestre complete quando $H_5$ o $W_5$ non sono multipli di $M$.
+RPB opera all'interno di finestre fisse $7 \times 7$: le differenze relative
+intra-finestra sono identiche a qualsiasi risoluzione, garantendo
+generalizzazione senza distribution shift posizionale.
 
 #### Step 3 — Style Prototype (calcolato una sola volta per fotografo, poi cached)
 
@@ -957,57 +1120,78 @@ $$\text{BilinearUp}(\mathbf{F})_{c,i',j'} = (1-\Delta u)(1-\Delta v)\,F_{c,\lflo
 
 con $\Delta u = u - \lfloor u\rfloor \in [0,1)$. Le coordinate normalizzate garantiscono che l'upsampling sia indipendente dalla risoluzione assoluta.
 
-#### Step 5 — Bilateral Grid Predictions
+#### Step 5 — Bilateral Grid Predictions e Confidence Mask
 
-Le bilateral grid hanno risoluzione spaziale **fissa** indipendentemente dalla risoluzione dell'input.
+Le bilateral grid hanno risoluzione spaziale **fissa** indipendentemente dalla
+risoluzione dell'input.
 
-$$G_{global} = \text{GlobalBranch}\!\left(\text{AdaIN}(P_5,\, \mathbf{s})\right) \in \mathbb{R}^{B \times 12 \times 8 \times 8 \times L_b}$$
+$$G_{global} = \text{GlobalBranch}\!\left(\text{AdaIN}(P_5,\, \mathbf{s})\right)
+\in \mathbb{R}^{B \times 12 \times 8 \times 8 \times L_b}$$
 
-$$\mathbf{f}_{global} = \frac{1}{H_5 W_5}\sum_{i,j}\text{AdaIN}(P_5, \mathbf{s})_{i,j} \in \mathbb{R}^{B \times 192}$$
+$$G_{local} = \text{reshape}\!\left(\text{Conv}_{1\times 1}\!\left(
+\text{AdaptiveAvgPool}(\mathbf{x}_3,\; (16, 16))\right)\right)
+\in \mathbb{R}^{B \times 12 \times 16 \times 16 \times L_b}$$
 
-$$G_{global} = \text{reshape}\!\left(\mathbf{W}_{gb,2}\,\delta(\mathbf{W}_{gb,1}\,\mathbf{f}_{global})\right) \in \mathbb{R}^{B \times 12 \times 8 \times 8 \times L_b}$$
+**Nota:** la confidence mask $\alpha$ dipende dalla divergenza $\mathbf{D}$
+tra i due output delle griglie, che è disponibile solo dopo i Step 6 e 7.
+Il forward pass procede quindi come segue:
 
-$$\mathbf{x}_4 = \text{SPADEResBlock}(P_4,\, \mathbf{C}_4) \in \mathbb{R}^{B \times 96 \times H_4 \times W_4}$$
+1. Si calcolano $G_{global}$ e $G_{local}$ (questo step)
+2. Si eseguono i bilateral slicing globale e locale (Step 6 e 7) per ottenere
+   $I_g$ e $I_l$
+3. Si calcola $\mathbf{D} = |I_l - I_g|$ e si predice $\alpha$ (Step 5b)
+4. Si esegue il blending (Step 8)
 
-$$\mathbf{x}_3 = \text{SPADEResBlock}\!\left(\text{BilinearUp}(\mathbf{x}_4, (H_3, W_3)) + P_3,\, \mathbf{C}_3\right) \in \mathbb{R}^{B \times 96 \times H_3 \times W_3}$$
+#### Step 5b — Confidence Mask (eseguito dopo Step 6 e 7)
 
-$$G_{local} = \text{reshape}\!\left(\text{Conv}_{1\times 1}\!\left(\text{AdaptiveAvgPool}(\mathbf{x}_3,\; (16, 16))\right)\right) \in \mathbb{R}^{B \times 12 \times 16 \times 16 \times L_b}$$
+$$\mathbf{D}_3 = \text{AdaptiveAvgPool}\!\left(|I_l - I_g|,\; (H_3, W_3)\right)
+\in \mathbb{R}^{B \times 3 \times H_3 \times W_3}$$
 
-La confidence mask:
+$$\tilde{P}_4 = \text{BilinearUp}(P_4,\; (H_3, W_3))$$
 
-$$\alpha = \sigma\!\left(\text{Conv}_{1\times 1}\!\left(\delta\!\left(\text{Conv}_{3\times 3}([\tilde{P}_4;\, P_3])\right)\right)\right) \in [0,1]^{B \times 1 \times H_3 \times W_3}$$
+$$\alpha_{low} = \sigma\!\left(\text{Conv}_{1\times1}\!\left(\delta\!\left(
+\text{Conv}_{3\times3}([\tilde{P}_4;\ P_3;\ \mathbf{D}_3])\right)\right)\right)
+\in [0,1]^{B \times 1 \times H_3 \times W_3}$$
 
-$$\alpha^{full} = \text{BilinearUp}(\alpha,\; (H, W)) \in [0,1]^{B \times 1 \times H \times W}$$
-
-con $\tilde{P}_4 = \text{BilinearUp}(P_4, (H_3, W_3))$.
+$$\alpha^{full} = \text{BilinearUp}(\alpha_{low},\; (H, W))
+\in [0,1]^{B \times 1 \times H \times W}$$
 
 #### Step 6 — Bilateral Slicing Globale a Risoluzione Piena
 
-Per ogni pixel $(i,j) \in \{0,\ldots,H-1\} \times \{0,\ldots,W-1\}$, guida di luminanza e coordinate nella grid globale $8\times 8\times L_b$:
+Per ogni pixel $(i,j)$, guida cromatica mista e coordinate nella grid globale
+$8\times 8\times L_b$:
 
-$$g(i,j) = 0.299\,I^{src}_R(i,j) + 0.587\,I^{src}_G(i,j) + 0.114\,I^{src}_B(i,j)$$
+$$g(i,j) = 0.5\cdot L^*(i,j) + 0.25\cdot|a^*(i,j)| + 0.25\cdot|b^*(i,j)|
+\quad \text{(normalizzato in } [0,1]\text{)}$$
 
-$$x_g^{glob}(j) = \frac{j}{W-1}\cdot 7, \quad y_g^{glob}(i) = \frac{i}{H-1}\cdot 7, \quad l_g(i,j) = g(i,j)\cdot(L_b - 1)$$
+$$x_g^{glob}(j) = \frac{j}{W-1}\cdot 7, \quad
+y_g^{glob}(i) = \frac{i}{H-1}\cdot 7, \quad
+l_g(i,j) = g(i,j)\cdot(L_b - 1)$$
 
-$$\left[\mathbf{A}^{glob}_{ij},\,\mathbf{b}^{glob}_{ij}\right] = \text{TrilinearInterp}\!\left(G_{global},\; x_g^{glob}(j),\; y_g^{glob}(i),\; l_g(i,j)\right)$$
+$$\left[\mathbf{A}^{glob}_{ij},\,\mathbf{b}^{glob}_{ij}\right] =
+\text{TrilinearInterp}\!\left(G_{global},\; x_g^{glob}(j),\;
+y_g^{glob}(i),\; l_g(i,j)\right)$$
 
 $$I_g(i,j) = \mathbf{A}^{glob}_{ij}\cdot I^{src}(i,j) + \mathbf{b}^{glob}_{ij}$$
 
 #### Step 7 — Bilateral Slicing Locale a Risoluzione Piena
 
-Analogamente per la grid locale $16\times 16\times L_b$:
+$$x_g^{loc}(j) = \frac{j}{W-1}\cdot 15, \quad
+y_g^{loc}(i) = \frac{i}{H-1}\cdot 15$$
 
-$$x_g^{loc}(j) = \frac{j}{W-1}\cdot 15, \quad y_g^{loc}(i) = \frac{i}{H-1}\cdot 15$$
-
-$$\left[\mathbf{A}^{loc}_{ij},\,\mathbf{b}^{loc}_{ij}\right] = \text{TrilinearInterp}\!\left(G_{local},\; x_g^{loc}(j),\; y_g^{loc}(i),\; l_g(i,j)\right)$$
+$$\left[\mathbf{A}^{loc}_{ij},\,\mathbf{b}^{loc}_{ij}\right] =
+\text{TrilinearInterp}\!\left(G_{local},\; x_g^{loc}(j),\;
+y_g^{loc}(i),\; l_g(i,j)\right)$$
 
 $$I_l(i,j) = \mathbf{A}^{loc}_{ij}\cdot I_g(i,j) + \mathbf{b}^{loc}_{ij}$$
 
-La composizione $I_l = \text{BilSlice}_{local}(\text{BilSlice}_{global}(I^{src}))$ realizza una pipeline di due trasformazioni affini dipendenti dalla scena: la prima stabilisce il colore globale (mood, WB, cast), la seconda raffina per zone semantiche (skin, cielo, ombre, mezzitoni).
+La guida $l_g(i,j)$ è la stessa nei due slicing: coerenza nella discretizzazione
+della dimensione di luminanza/chroma per entrambe le griglie.
 
 #### Step 8 — Blending con Confidence Mask
 
-$$I_{out}(i,j) = \alpha^{full}(i,j)\cdot I_l(i,j) + \bigl(1 - \alpha^{full}(i,j)\bigr)\cdot I_g(i,j)$$
+$$I_{out}(i,j) = \alpha^{full}(i,j)\cdot I_l(i,j) +
+\bigl(1 - \alpha^{full}(i,j)\bigr)\cdot I_g(i,j)$$
 
 #### Step 9 — Clipping e Gamma Re-encoding
 
@@ -1025,7 +1209,7 @@ Il clipping introduce non-differenziabilità dove $I_{out} \notin [0,1]$: questo
 |------------|---------------------|-------------------------------|------------|
 | Pipeline RAW (§6.2) | ✅ produce $(H,W)$ | Coordinate normalizzate, Lanczos adattivo | fp32 |
 | CNN stem MobileNetV3 | Input $(H,W)$, output $(H_3,W_3)$ | Conv locali, stride fissato | fp16 |
-| Swin + RoPE (4 teste) | Token $T(H,W)$ variabile | RoPE dipende solo da distanza relativa | fp16 |
+| Swin + RPB (4 teste) | Token $T(H,W)$ variabile | RPB opera su finestre fisse $M\times M$, differenze relative invarianti alla risoluzione | fp16 |
 | GAP → Enc | ❌ output fisso $\mathbb{R}^{192}$ | Media su $(H_3,W_3)$ qualsiasi | fp16 |
 | Cross-attn ($K=20$) | Token $T(H,W)$ variabile, chiavi fisse | $K$ fissato, chiavi cached | fp16 |
 | $G_{global}$ | ❌ output fisso $8\times 8\times L_b$ | GAP elimina dimensioni spaziali | fp16 |
@@ -1038,30 +1222,55 @@ Il clipping introduce non-differenziabilità dove $I_{out} \notin [0,1]$: questo
 
 # 6.5 Funzione di Loss Composita: Color-Aesthetic Loss
 
-## 6.5.0 Motivazione e Inadeguatezza delle Loss Standard
+### 6.5.0 Motivazione e Inadeguatezza delle Loss Standard
 
-La funzione di loss è il componente più critico del sistema. Le loss standard hanno difetti fondamentali per il task di color grading fotografico.
+La funzione di loss è il componente più critico del sistema. Le loss standard hanno
+difetti fondamentali per il task di color grading fotografico.
 
-La **Mean Squared Error (MSE)** in RGB è non uniforme percettivamente, favorisce output "media" sfocata e pesa ugualmente errori in ombre e alte luci. La **MAE (L1)** ha gli stessi problemi percettivi. Nessuna delle due cattura la distribuzione spettrale globale dell'immagine né la sua struttura semantica multi-scala.
+La **Mean Squared Error (MSE)** in RGB è non uniforme percettivamente, favorisce output
+"media" sfocata e pesa ugualmente errori in ombre e alte luci. La **MAE (L1)** ha gli
+stessi problemi percettivi. Nessuna delle due cattura la distribuzione spettrale globale
+dell'immagine né la sua struttura semantica multi-scala.
+
+La **CIEDE2000**, pur essendo la metrica cromatica percettiva più accurata, presenta
+gradienti numericamente instabili nelle zone di bassa chroma (pixel quasi-grigi) e
+discontinuità nell'angolo hue. Usarla come unico termine cromatico fin dall'inizio del
+training crea gradienti rumorosi che rallentano la convergenza. Per questo motivo viene
+affiancata da una **L1 Lab**, usata come termine di warm-up nelle prime epoche e poi
+gradualmente disattivata.
 
 La **Color-Aesthetic Loss** proposta è:
 
-$$\boxed{\mathcal{L} = \lambda_{\Delta E}\,\mathcal{L}_{\Delta E} + \lambda_{hist}\,\mathcal{L}_{hist} + \lambda_{perc}\,\mathcal{L}_{perc} + \lambda_{chroma}\,\mathcal{L}_{chroma} + \lambda_{id}\,\mathcal{L}_{id} + \lambda_{TV}\,\mathcal{L}_{TV}}$$
+$$\boxed{\mathcal{L} = \lambda_{\Delta E}\,\mathcal{L}_{\Delta E} +
+\lambda_{L1Lab}\,\mathcal{L}_{L1Lab} +
+\lambda_{hist}\,\mathcal{L}_{hist} +
+\lambda_{perc}\,\mathcal{L}_{perc} +
+\lambda_{chroma}\,\mathcal{L}_{chroma} +
+\lambda_{id}\,\mathcal{L}_{id} +
+\lambda_{TV}\,\mathcal{L}_{TV} +
+\lambda_{lum}\,\mathcal{L}_{lum} +
+\lambda_e\,\mathcal{L}_{entropy}}$$
 
-con pesi $\lambda_{\Delta E} = 0.5,\ \lambda_{hist} = 0.3,\ \lambda_{perc} = 0.6,\ \lambda_{chroma} = 0.2,\ \lambda_{id} = 0.5,\ \lambda_{TV} = 0.01$.
+con pesi variabili secondo il curriculum della sezione 6.6.
 
-**Nota su fp16 e calcolo della loss.** Il calcolo della loss viene eseguito in fp32 (i tensori di input vengono promossi da fp16 a fp32 prima di entrare nel grafo della loss), per evitare underflow nei termini logaritmici e nelle radici quadrate di CIEDE2000. Questo è lo standard per l'uso di PyTorch AMP con loss complesse.
+**Nota su fp16 e calcolo della loss.** Il calcolo della loss viene eseguito in fp32
+(i tensori di input vengono promossi da fp16 a fp32 prima di entrare nel grafo della loss),
+per evitare underflow nei termini logaritmici e nelle radici quadrate di CIEDE2000.
 
 **Tabella riassuntiva dei ruoli.**
 
 | Termine | Supervisiona | Livello |
 |---|---|---|
 | $\mathcal{L}_{\Delta E}$ | Accuratezza cromatica percettiva pixel-wise | Pixel |
+| $\mathcal{L}_{L1Lab}$ | Warm-up convergenza cromatica stabile | Pixel |
 | $\mathcal{L}_{hist}$ | Distribuzione globale dei colori | Globale |
 | $\mathcal{L}_{perc}$ | Struttura semantica multi-scala | Feature |
 | $\mathcal{L}_{chroma}$ | Saturazione isolata + hue circolare | Pixel |
 | $\mathcal{L}_{id}$ | Prevenzione overediting / stabilità | Regolarizzatore |
 | $\mathcal{L}_{TV}$ | Smoothness della bilateral grid | Regolarizzatore geometrico |
+| $\mathcal{L}_{lum}$ | Preservazione della struttura luminosa | Regolarizzatore strutturale |
+| $\mathcal{L}_{entropy}$ | Polarizzazione della confidence mask | Regolarizzatore mask |
+
 
 ---
 
@@ -1114,6 +1323,37 @@ $$\Delta E_{00}(\mathbf{c}_1, \mathbf{c}_2) = \sqrt{\left(\frac{\Delta L'}{S_L}\
 $$\mathcal{L}_{\Delta E} = \frac{1}{HW}\sum_{i=1}^{H}\sum_{j=1}^{W} \Delta E_{00}\!\left(I^{pred}_{Lab}(i,j),\ I^{tgt}_{Lab}(i,j)\right)$$
 
 Con $\varepsilon$-smoothing $C_k' = \sqrt{(a_k')^2 + (b_k^*)^2 + \varepsilon}$ per differenziabilità.
+
+---
+
+**Motivazione del warm-up.** CIEDE2000 è la metrica cromatica percettiva di riferimento
+industriale, ma presenta due problemi numerici come loss di training: (1) i gradienti
+sono molto piccoli nelle zone di bassa chroma (pixel quasi-grigi), dove
+$C' = \sqrt{a'^2 + b^{*2} + \varepsilon} \approx 0$ rende i termini $S_C$ e $S_H$
+quasi costanti; (2) la discontinuità nell'angolo hue introduce gradienti rumorosi
+nelle prime epoche quando le predizioni sono ancora lontane dal target.
+
+Per questi motivi, nelle prime 5 epoche si usa come termine cromatico primario la
+**L1 in spazio CIE Lab**, che ha gradienti uniformi e stabili su tutto il range cromatico:
+
+$$\mathcal{L}_{L1Lab} = \frac{1}{HW}\sum_{i=1}^{H}\sum_{j=1}^{W}
+\left\|I^{pred}_{Lab}(i,j) - I^{tgt}_{Lab}(i,j)\right\|_1$$
+
+A partire dall'epoca 6, $\mathcal{L}_{L1Lab}$ viene gradualmente disattivata mentre
+$\mathcal{L}_{\Delta E}$ viene introdotta con peso crescente (vedi curriculum §6.6).
+Il trasferimento graduale garantisce continuità del segnale di training: la rete non
+riceve uno shock di gradienti quando la loss cambia.
+
+**Formula CIEDE2000.** [invariata — stessa formula della versione precedente]
+
+**Loss CIEDE2000:**
+
+$$\mathcal{L}_{\Delta E} = \frac{1}{HW}\sum_{i=1}^{H}\sum_{j=1}^{W}
+\Delta E_{00}\!\left(I^{pred}_{Lab}(i,j),\ I^{tgt}_{Lab}(i,j)\right)$$
+
+Con $\varepsilon$-smoothing $C_k' = \sqrt{(a_k')^2 + (b_k^*)^2 + \varepsilon}$
+per differenziabilità.
+
 
 ---
 
@@ -1251,25 +1491,108 @@ $$\mathcal{L}_{TV} = \frac{1}{|\mathcal{G}|}\sum_{i,j} \left(\left\|\mathbf{A}_{
 
 ---
 
-## 6.5.7 Differenziabilità
+### 6.5.7 Luminance Preservation Loss
 
-**Teorema 3 (Differenziabilità della Color-Aesthetic Loss).** La funzione $\mathcal{L}: \mathbb{R}^{H\times W\times 3} \to \mathbb{R}_{\geq 0}$ è differenziabile quasi ovunque rispetto a $I^{pred}$ e, per $\mathcal{L}_{TV}$, rispetto ai coefficienti $\mathbf{A}_{ij}$ della bilateral grid.
+**Motivazione.** Le loss precedenti supervisionano la qualità cromatica dell'output
+ma non vincolano esplicitamente la struttura luminosa. In assenza di tale vincolo,
+la rete può apprendere trasformazioni che alterano la luminanza per minimizzare ΔE
+su alcune zone cromatiche difficili — producendo perdita di dettagli e aloni colorati.
+Il color grading professionale modifica i colori, non la struttura: la luminanza
+percepita dell'immagine dovrebbe essere preservata a meno di correzioni di esposizione
+globali intenzionali.
+
+**Formulazione.** Sia $L^{*,pred}$ il canale di luminanza CIE Lab dell'immagine predetta
+e $L^{*,src}$ quello dell'immagine sorgente (non target). La loss penalizza le differenze
+di luminanza rispetto alla sorgente:
+
+$$\mathcal{L}_{lum} = \frac{1}{HW}\sum_{i=1}^{H}\sum_{j=1}^{W}
+\left|L^{*,pred}(i,j) - L^{*,src}(i,j)\right|$$
+
+**Nota cruciale:** $\mathcal{L}_{lum}$ usa $I^{src}$ come riferimento, non $I^{tgt}$.
+Questo è intenzionale: il fotografo potrebbe aver modificato leggermente la luminanza
+(correzioni di esposizione, dodge & burn), e vincolare $I^{pred}$ a replicare
+esattamente $L^{*,tgt}$ sarebbe ridondante con $\mathcal{L}_{\Delta E}$. Il vincolo
+rispetto a $I^{src}$ impone invece che la rete non si allontani troppo dalla struttura
+luminosa originale, lasciando libertà per le correzioni intenzionali che il fotografo
+ha effettivamente applicato.
+
+**Peso $\lambda_{lum} = 0.3$.** Il peso è scelto abbastanza alto da produrre un
+gradiente strutturale significativo, ma inferiore a $\lambda_{\Delta E}$ per non
+impedire correzioni di esposizione legittime. Nei primi 5 epoche del curriculum
+$\lambda_{lum}$ è attivo al massimo valore per stabilizzare subito la struttura,
+poi rimane costante.
+
+**Differenza da $\mathcal{L}_{id}$.** $\mathcal{L}_{id}$ previene l'overediting
+in ampiezza (la trasformazione totale non deve essere troppo grande);
+$\mathcal{L}_{lum}$ vincola specificamente la dimensione luminosa della trasformazione,
+indipendentemente dall'ampiezza delle modifiche cromatiche. I due regolarizzatori
+sono complementari: si può avere un editing cromatico aggressivo (hue shift totale,
+cambio di saturazione) con $\mathcal{L}_{lum}$ bassa, ma non si possono avere
+aloni strutturali senza aumentare $\mathcal{L}_{lum}$.
+
+### 6.5.8 Entropy Loss per la Confidence Mask
+
+**Motivazione.** Se la confidence mask $\alpha(x,y)$ è vicina a 0.5 in ampie zone
+dell'immagine, il blending $\alpha \cdot I_{local} + (1-\alpha) \cdot I_{global}$
+produce una media tra due immagini con trasformazioni potenzialmente diverse — generando
+aloni cromatici ai bordi delle regioni semantiche dove le due griglie divergono.
+La mask deve prendere decisioni nette: o usa la griglia locale o quella globale.
+
+**Formulazione:**
+
+$$\mathcal{L}_{entropy} = -\frac{\lambda_e}{HW}\sum_{i,j}
+\left[\alpha_{ij}\log(\alpha_{ij} + \varepsilon) +
+(1-\alpha_{ij})\log(1-\alpha_{ij} + \varepsilon)\right]$$
+
+con $\lambda_e = 0.01$ e $\varepsilon = 10^{-6}$.
+
+**Proprietà:** $\mathcal{L}_{entropy}$ è minimizzata (valore 0) quando $\alpha \in \{0,1\}$
+ovunque (mask binaria perfetta) e massimizzata (valore $\log 2 \approx 0.693$ per pixel)
+quando $\alpha = 0.5$ ovunque. Il segno negativo nella formula fa sì che minimizzare
+$\mathcal{L}_{entropy}$ equivalga a massimizzare la certezza della mask.
+
+**Interazione con $\mathbf{D}_3$.** La confidence mask condizionata sulla divergenza
+(§5.1.7) riceve già un segnale diretto su dove le due griglie differiscono.
+$\mathcal{L}_{entropy}$ agisce come complemento: mentre $\mathbf{D}_3$ informa
+la mask su dove decidere, $\mathcal{L}_{entropy}$ la incentiva a decidere con certezza.
+
+
+### 6.5.9 Differenziabilità
+
+**Teorema 3 (Differenziabilità della Color-Aesthetic Loss).** La funzione
+$\mathcal{L}: \mathbb{R}^{H\times W\times 3} \to \mathbb{R}_{\geq 0}$ è differenziabile
+quasi ovunque rispetto a $I^{pred}$ e, per $\mathcal{L}_{TV}$, rispetto ai coefficienti
+$\mathbf{A}_{ij}$ della bilateral grid.
 
 *Dimostrazione per componenti:*
 
-$\mathcal{L}_{\Delta E}$: con $\varepsilon$-smoothing su tutte le radici quadrate, differenziabile q.o.
+$\mathcal{L}_{\Delta E}$: con $\varepsilon$-smoothing su tutte le radici quadrate,
+differenziabile q.o.
 
-$\mathcal{L}_{hist}$: il kernel gaussiano è $C^\infty$; la somma cumulata è lineare; la norma $L^1$ delle CDF è differenziabile q.o. (subgradiente $= \pm 1$ nei punti di non-differenziabilità, che hanno misura zero durante il training).
+$\mathcal{L}_{L1Lab}$: norma $\ell_1$ in spazio Lab; differenziabile q.o.
+(subgradiente nei punti nulli).
 
-$\mathcal{L}_{perc}$: composizione di convoluzione lineare e ReLU su VGG16 frozen; differenziabile q.o.
+$\mathcal{L}_{hist}$: il kernel gaussiano è $C^\infty$; la somma cumulata è lineare;
+la norma $L^1$ delle CDF è differenziabile q.o.
 
-$\mathcal{L}_{chroma}$: $C^* = \sqrt{\cdot + \varepsilon}$ è ovunque differenziabile; $d_{circ}(h_1, h_2) = \arccos(\cos(h_1-h_2))$ è differenziabile q.o. (non differenziabile solo in $h_1 = h_2$ e $h_1 - h_2 = \pi$, entrambi di misura zero).
+$\mathcal{L}_{perc}$: composizione di convoluzione lineare e ReLU su VGG16 frozen;
+differenziabile q.o.
 
-$\mathcal{L}_{id}$: norma $\ell_1$, differenziabile q.o. (subgradiente nei punti nulli).
+$\mathcal{L}_{chroma}$: $C^* = \sqrt{\cdot + \varepsilon}$ è ovunque differenziabile;
+$d_{circ}$ è differenziabile q.o.
 
-$\mathcal{L}_{TV}$: norma di Frobenius, differenziabile ovunque rispetto ai coefficienti $\mathbf{A}_{ij}$.
+$\mathcal{L}_{id}$: norma $\ell_1$, differenziabile q.o.
+
+$\mathcal{L}_{TV}$: norma di Frobenius, differenziabile ovunque.
+
+$\mathcal{L}_{lum}$: norma $\ell_1$ su canale $L^*$; la conversione Lab è differenziabile
+q.o. (subgradiente nel punto di giunzione della funzione $f(t)$); differenziabile q.o.
+
+$\mathcal{L}_{entropy}$: $x\log x$ è $C^\infty$ su $(0,1)$; con $\varepsilon > 0$,
+differenziabile ovunque su $[0,1]$.
 
 La somma pesata di funzioni differenziabili q.o. è differenziabile q.o. $\square$
+
 
 ---
 
@@ -1297,20 +1620,35 @@ In $K = O(1/\epsilon^2)$ passi si raggiunge $\|\nabla\mathcal{L}\| \leq \epsilon
 
 ## 6.6 Curriculum dei Pesi della Loss
 
-| Epoca | $\lambda_{\Delta E}$ | $\lambda_{hist}$ | $\lambda_{perc}$ | $\lambda_{chroma}$ | $\lambda_{id}$ | $\lambda_{TV}$ |
-|-------|---------------------|-----------------|-----------------|---------------------|----------------|----------------|
-| 1–5   | 0.6 | 0.4 | 0.0 | 0.0 | 0.5 | 0.01 |
-| 6–10  | 0.5 | 0.3 | 0.3 | 0.1 | 0.5 | 0.01 |
-| 11–20 | 0.5 | 0.3 | 0.6 | 0.2 | 0.5 | 0.01 |
-| 21+   | 0.5 | 0.3 | 0.6 | 0.2 | 0.5 | 0.01 |
+| Epoca | $\lambda_{\Delta E}$ | $\lambda_{L1Lab}$ | $\lambda_{hist}$ | $\lambda_{perc}$ | $\lambda_{chroma}$ | $\lambda_{id}$ | $\lambda_{TV}$ | $\lambda_{lum}$ | $\lambda_e$ |
+|-------|---------------------|--------------------|-----------------|-----------------|---------------------|----------------|----------------|-----------------|-------------|
+| 1–5   | 0.0 | 0.8 | 0.4 | 0.0 | 0.0 | 0.5 | 0.01 | 0.3 | 0.01 |
+| 6–10  | 0.3 | 0.4 | 0.3 | 0.3 | 0.1 | 0.5 | 0.01 | 0.3 | 0.01 |
+| 11–20 | 0.5 | 0.0 | 0.3 | 0.6 | 0.2 | 0.5 | 0.01 | 0.3 | 0.01 |
+| 21+   | 0.5 | 0.0 | 0.3 | 0.6 | 0.2 | 0.5 | 0.01 | 0.3 | 0.01 |
 
 **Motivazione del curriculum.**
 
-Nelle **epoche 1–5** si usano solo $\mathcal{L}_{\Delta E}$, $\mathcal{L}_{hist}$ e $\mathcal{L}_{TV}$: forniscono gradiente stabile e diretto. $\mathcal{L}_{TV}$ è attiva dall'inizio perché la bilateral grid deve essere smooth fin dai primi passi di ottimizzazione — una grid discontinua nelle prime epoche può produrre artefatti difficili da correggere in seguito.
+Nelle **epoche 1–5**: $\mathcal{L}_{L1Lab}$ è il termine cromatico dominante
+(peso 0.8) perché ha gradienti stabili e uniformi che guidano la convergenza rapida
+verso la regione corretta dello spazio delle soluzioni. $\mathcal{L}_{\Delta E}$ è
+disattivata — i suoi gradienti instabili nelle prime epoche rallenterebbero la
+convergenza invece di accelerarla. $\mathcal{L}_{lum}$ è attiva al massimo peso
+fin dall'inizio: è critico che la struttura luminosa sia preservata fin dal primo
+aggiornamento dei pesi, prima che la bilateral grid possa apprendere trasformazioni
+strutturalmente distruttive. $\mathcal{L}_{TV}$ è attiva dall'inizio per garantire
+smoothness della griglia fin dai primi passi. $\mathcal{L}_{entropy}$ è attiva fin
+dall'inizio con peso basso per iniziare a polarizzare la confidence mask.
 
-Nelle **epoche 6–10** si introduce $\mathcal{L}_{perc}$ a peso ridotto (0.3) e $\mathcal{L}_{chroma}$ (0.1): la rete ha già una trasformazione cromatica di base corretta e può beneficiare del segnale strutturale di VGG16.
+Nelle **epoche 6–10**: transizione graduale da $\mathcal{L}_{L1Lab}$ a
+$\mathcal{L}_{\Delta E}$. Entrambe sono attive con pesi dimezzati rispetto ai valori
+finali, garantendo continuità del segnale di training. Si introducono $\mathcal{L}_{perc}$
+(0.3) e $\mathcal{L}_{chroma}$ (0.1): la rete ha già una trasformazione cromatica di
+base corretta e può beneficiare del segnale strutturale di VGG16.
 
-Nelle **epoche 11+** si raggiungono i pesi finali: $\mathcal{L}_{perc}$ a 0.6 e $\mathcal{L}_{chroma}$ a 0.2 per il raffinamento della direzionalità cromatica.
+Nelle **epoche 11+**: $\mathcal{L}_{L1Lab}$ è completamente disattivata.
+$\mathcal{L}_{\Delta E}$ raggiunge il peso finale 0.5. Tutti gli altri termini
+rimangono costanti per il resto del training.
 
 ---
 
@@ -1319,11 +1657,14 @@ Nelle **epoche 11+** si raggiungono i pesi finali: $\mathcal{L}_{perc}$ a 0.6 e 
 | Termine | Spazio | Differenziabile | Convessa | Inv. permutazioni | Penalizza |
 |---------|--------|-----------------|----------|-------------------|-----------|
 | $\mathcal{L}_{\Delta E}$ | Lab | ✅ q.o. | ❌ | ❌ | Errore cromatico percettivo pixel-wise |
+| $\mathcal{L}_{L1Lab}$ | Lab | ✅ q.o. | ✅ | ❌ | Errore cromatico warm-up stabile |
 | $\mathcal{L}_{hist}$ | Lab (CDF) | ✅ q.o. | ❌ | ✅ | Distribuzione globale dei colori |
 | $\mathcal{L}_{perc}$ | Feature VGG16 | ✅ q.o. | ❌ | ❌ | Struttura semantica bi-scala |
 | $\mathcal{L}_{chroma}$ | $(C^*, h^*)$ | ✅ q.o. | ❌ | ❌ | Saturazione isolata + hue circolare |
 | $\mathcal{L}_{id}$ | RGB | ✅ q.o. | ✅ | ❌ | Overediting / identità |
 | $\mathcal{L}_{TV}$ | Coeff. grid | ✅ | ✅ | — | Smoothness della bilateral grid |
+| $\mathcal{L}_{lum}$ | $L^*$ Lab | ✅ q.o. | ✅ | ❌ | Preservazione struttura luminosa |
+| $\mathcal{L}_{entropy}$ | $\alpha$ mask | ✅ | ❌ | — | Polarizzazione confidence mask |
 | $\mathcal{L}$ totale | — | ✅ q.o. | ❌ | — | Combinazione pesata curriculum |
 
 ## 7. Dataset Disponibili
@@ -1603,7 +1944,8 @@ Il ΔE atteso di 4.5 (leggermente peggiore del 4.2 del progetto originale con Ef
 |------|-----------|-------|-------------|
 | **Setup & Dataset** | 1-2 | Download FiveK, preprocessing fp16, data loaders, crop $512\times384$ resolution-agnostic | Dataset pipeline ready |
 | **Baseline** | 3 | MobileNetV3-Small + BilGrid senza conditioning (A0) | Benchmark lower bound |
-| **CNN + Swin Encoder** | 4-5 | MobileNetV3-Small stem + Swin stage 4-5 con RoPE, 4 teste, gradient checkpointing | Encoder con context globale |
+| **CNN + Swin Encoder** | 4-5 | MobileNetV3-Small stem + Swin stage 4-5 con RPB, 4 teste, gradient checkpointing
+ | Encoder con context globale |
 | **Bilateral Grid Branches** | 6-7 | Global (8×8×8, AdaIN) + Local (16×16×8, SPADE 128ch) + Confidence Mask | HybridStyleNet senza meta |
 | **Set Transformer + Cross-Attn** | 8-9 | Style Prototype (4 teste) + Cross-Attention (K=20 subset fisso) | Conditioning completo |
 | **Meta-Training Reptile** | 10-11 | Reptile ($M=2$ task) + task augmentation su FiveK, fp16 | $\theta_{meta}$ checkpoint |
@@ -1619,7 +1961,9 @@ Il ΔE atteso di 4.5 (leggermente peggiore del 4.2 del progetto originale con Ef
 
 1. **Architettura CNN + Swin Transformer ibrida per photographer-specific color grading su GPU consumer** ⭐⭐⭐ **CONTRIBUTO PRINCIPALE**
    - Primo lavoro che motiva e risolve il problema del context globale nel color grading fotografico con un encoder ibrido CNN + Swin su GPU consumer (RTX 3080, 10 GB VRAM)
-   - MobileNetV3-Small + Swin con 4 teste di attenzione + RoPE: complessità $O(n)$, generalizzazione a risoluzioni non viste, compatibilità nativa fp16
+   - MobileNetV3-Small + Swin con 4 teste di attenzione e Relative Position Bias:
+complessità $O(n)$, generalizzazione a risoluzioni non viste per costruzione
+della window attention, compatibilità nativa fp16
    - CNN stem preserva l'inductive bias locale critico per il few-shot regime con footprint ridotto
 
 2. **Set Transformer + Cross-Attention con subset fisso K=20 per in-context style conditioning** ⭐⭐⭐
@@ -1665,7 +2009,8 @@ Il ΔE atteso di 4.5 (leggermente peggiore del 4.2 del progetto originale con Ef
 Questa documentazione delinea la tesi magistrale su **photographer-specific color grading via deep learning**, con un approccio rigorosamente **end-to-end** e interamente ottimizzato per GPU consumer con **fp16 mixed precision**.
 
 **Key Takeaways**:
-1. Il problema chiave non era l'architettura generica — era la mancanza di **context semantico globale** nelle CNN, risolto con l'encoder ibrido MobileNetV3-Small + Swin Transformer (4 teste, RoPE)
+1. Il problema chiave non era l'architettura generica — era la mancanza di **context semantico globale** nelle CNN, risolto con l'encoder ibrido MobileNetV3-Small + Swin Transformer
+(4 teste, Relative Position Bias)
 2. Il secondo problema era l'aggregazione robusta dello stile — risolto con Set Transformer (4 teste) + Cross-Attention con subset fisso K=20
 3. Il terzo problema era il meta-overfitting e l'incompatibilità fp16 di MAML — risolto con Reptile (primo ordine, nativo fp16) + task augmentation in Lab space
 4. Le ottimizzazioni hardware (fp16, gradient checkpointing, batch $512\times384$, grid 16×16, SPADE 128ch, K=20) rendono l'intero sistema eseguibile su RTX 3080 (10 GB VRAM) senza sacrificare la coerenza matematica dell'approccio

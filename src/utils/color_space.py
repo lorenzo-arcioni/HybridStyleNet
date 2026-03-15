@@ -8,10 +8,13 @@ Le operazioni sono batch-safe e resolution-agnostic.
 
 Pipeline supportata:
     sRGB ↔ sRGB lineare ↔ CIE XYZ D65 ↔ CIE L*a*b*
+
+Aggiunta rispetto alla versione base:
+    mixed_chromatic_guide()  — guida cromatica mista per bilateral grid slicing
+                               g = 0.5·L* + 0.25·|a*| + 0.25·|b*|  (§6.3.2)
 """
 
 import torch
-import torch.nn.functional as F
 from typing import Tuple
 
 # ── Costanti ─────────────────────────────────────────────────────────────────
@@ -34,8 +37,8 @@ _M_XYZ_TO_SRGB = torch.tensor([
 ], dtype=torch.float32)
 
 # Soglie per la funzione di trasferimento sRGB
-_SRGB_LINEAR_THRESH   = 0.0031308   # soglia linearizzazione
-_SRGB_ENCODED_THRESH  = 0.04045     # soglia gamma encoding
+_SRGB_LINEAR_THRESH   = 0.0031308
+_SRGB_ENCODED_THRESH  = 0.04045
 _SRGB_ALPHA           = 0.055
 _SRGB_GAMMA           = 2.4
 _SRGB_LINEAR_SCALE    = 12.92
@@ -45,6 +48,10 @@ _LAB_DELTA      = 6.0 / 29.0
 _LAB_DELTA_3    = _LAB_DELTA ** 3           # ≈ 0.008856
 _LAB_COEFF_A    = 1.0 / (3.0 * _LAB_DELTA ** 2)  # ≈ 7.787
 _LAB_COEFF_B    = 4.0 / 29.0               # ≈ 0.13793
+
+# Normalizzatore per la guida cromatica mista:
+# max teorico = 0.5*100 + 0.25*128 + 0.25*128 = 114.0
+_MIXED_GUIDE_MAX = 114.0
 
 EPS = 1e-8
 
@@ -145,9 +152,9 @@ def xyz_to_lab(xyz: torch.Tensor) -> torch.Tensor:
         L* ∈ [0, 100], a* ∈ [-128, 127], b* ∈ [-128, 127] approssimativamente.
     """
     white = _D65_WHITE.to(xyz.device)
-    xyz_n = xyz / white.clamp(min=EPS)          # normalizza per bianco D65
+    xyz_n = xyz / white.clamp(min=EPS)
 
-    f = _f_lab(xyz_n)                           # (..., 3)
+    f = _f_lab(xyz_n)
     fx, fy, fz = f[..., 0], f[..., 1], f[..., 2]
 
     L = 116.0 * fy - 16.0
@@ -280,3 +287,62 @@ def luminance(img: torch.Tensor) -> torch.Tensor:
     weights = torch.tensor([0.299, 0.587, 0.114],
                            dtype=img.dtype, device=img.device)
     return (img * weights).sum(dim=-1)
+
+
+# ── Guida cromatica mista per bilateral grid ─────────────────────────────────
+
+def mixed_chromatic_guide(img: torch.Tensor) -> torch.Tensor:
+    """
+    Calcola la guida cromatica mista g ∈ [0,1] per il bilateral grid slicing.
+
+    Formula (§6.3.2 della tesi):
+        g(i,j) = 0.5·L*(i,j) + 0.25·|a*(i,j)| + 0.25·|b*(i,j)|
+
+    normalizzata per il massimo teorico (~114.0) in modo che g ∈ [0,1].
+
+    Rispetto alla guida di luminanza pura (BT.601), questa guida è più
+    discriminativa cromaticamente: due pixel con la stessa luminanza ma
+    colori diversi (es. rosso saturo vs ciano saturo) ricevono valori
+    di guida diversi, migliorando la qualità dell'interpolazione trilineare
+    nelle zone di transizione cromatica.
+
+    NOTA: Il calcolo Lab viene eseguito in float32 anche se img è in fp16,
+    per stabilità numerica della conversione XYZ→Lab.
+
+    Args:
+        img: Tensore sRGB shape (B, 3, H, W) o (B, H, W, 3) o (..., 3),
+             valori in [0,1]. Se il tensore è in fp16, viene promosso
+             internamente a fp32 e il risultato è restituito in fp32.
+
+    Returns:
+        Guida g shape (B, H, W) se input è (B, 3, H, W),
+              (...,) se input è (..., 3),
+        valori in [0,1], dtype float32.
+
+    Example:
+        >>> img = torch.rand(2, 3, 384, 512)          # (B, C, H, W)
+        >>> g = mixed_chromatic_guide(img)             # (2, 384, 512)
+        >>> assert g.min() >= 0.0 and g.max() <= 1.0
+    """
+    # Gestione shape (B, 3, H, W) → (B, H, W, 3) per rgb_to_lab
+    channels_first = (img.dim() >= 3 and img.shape[-3] == 3
+                      and img.shape[-1] != 3)
+    if channels_first:
+        # (B, 3, H, W) → (B, H, W, 3)
+        img_hwc = img.float().permute(0, 2, 3, 1)
+    else:
+        img_hwc = img.float()
+
+    lab = rgb_to_lab(img_hwc)                      # (..., 3)
+    L_star = lab[..., 0]                           # [0, 100]
+    a_star = lab[..., 1].abs()                     # [0, ~128]
+    b_star = lab[..., 2].abs()                     # [0, ~128]
+
+    g = (0.5 * L_star + 0.25 * a_star + 0.25 * b_star) / _MIXED_GUIDE_MAX
+    g = g.clamp(0.0, 1.0)
+
+    if channels_first:
+        # (B, H, W) — nessuna permutazione necessaria, dim spaziali già ok
+        pass
+
+    return g

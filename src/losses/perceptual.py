@@ -1,173 +1,162 @@
 """
 losses/perceptual.py
 
-Perceptual Loss  (§6.4.3)  e  Style Loss con Gram Matrix  (§6.4.4).
+Perceptual Loss — similarità semantica multi-scala via VGG16.
 
-Perceptual Loss:
-    L_perc = Σ_l w_l · (1/C_l H_l W_l) ‖φ_l(pred) - φ_l(tgt)‖²_F
+Usa le feature maps di VGG16 pre-addestrata su ImageNet (frozen) a due
+layer specifici per calcolare la distanza L2 normalizzata tra immagine
+predetta e target nella rappresentazione spazio delle feature.
 
-Style Loss:
-    L_style = (1/4) Σ_l ‖G_l(pred) - G_l(tgt)‖²_F
+Riferimento tesi: §6.5.3
+Formula: L_perc = Σ_{l∈{2,3}} w_l · (1/C_l H_l W_l) · ‖φ_l(pred) - φ_l(tgt)‖²_F
 
-dove φ_l sono le feature maps di VGG19 frozen ai layer:
-    relu1_2, relu2_2, relu3_4, relu4_4
+Layer usati:
+    relu2_2  → C=128, H/2 × W/2  — texture, pattern semplici
+    relu3_3  → C=256, H/4 × W/4  — strutture, parti semantiche
+Pesi: w = [1.0, 0.75]
+
+NOTA: I pesi VGG16 sono sempre frozen (requires_grad=False).
+      Il calcolo avviene in float32, indipendentemente dalla precisione
+      del forward pass del modello principale.
+
+NOTA sul peso λ_perc = 0.6:
+    Aumentato da 0.4 rispetto alla versione con style loss, per compensare
+    la rimozione di L_style (ridondante con L_perc su stesse feature VGG16,
+    correlazione ρ ≈ 1.0 sul ranking delle trasformazioni — §6.5.3).
 """
-
-import logging
-from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torchvision import models
+from torchvision.models import VGG16_Weights
+from typing import List, Dict
 
-logger = logging.getLogger(__name__)
+EPS = 1e-8
 
-# Layer VGG19 e pesi perceptual (§6.4.3, tabella)
-_VGG_LAYERS  = ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]
-_VGG_WEIGHTS = [1.0, 0.75, 0.5, 0.25]
+# Nomi dei layer VGG16 e pesi corrispondenti (§6.5.3)
+_VGG_LAYER_NAMES  = ["relu2_2", "relu3_3"]
+_VGG_LAYER_WEIGHTS = {"relu2_2": 1.0, "relu3_3": 0.75}
 
-# Normalizzazione ImageNet (VGG19 è addestrato su immagini normalizzate)
-_VGG_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-_VGG_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+# Indici nei features di torchvision VGG16 corrispondenti ai layer target
+# VGG16 features sequenziali:
+#   0  conv1_1  1  relu1_1  2  conv1_2  3  relu1_2  4  maxpool
+#   5  conv2_1  6  relu2_1  7  conv2_2  8  relu2_2  ← indice 8
+#   9  maxpool
+#  10  conv3_1 11  relu3_1 12  conv3_2 13  relu3_2 14  conv3_3 15  relu3_3  ← indice 15
+_VGG_LAYER_INDICES: Dict[str, int] = {
+    "relu2_2": 8,
+    "relu3_3": 15,
+}
+
+# Statistiche ImageNet per la normalizzazione dell'input a VGG16
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
+_IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
 
 
-class VGG19Features(nn.Module):
+class VGG16FeatureExtractor(nn.Module):
     """
-    Estrattore di feature da VGG19 pre-addestrato (pesi congelati).
+    Estrae feature maps da VGG16 ai layer relu2_2 e relu3_3.
 
-    Restituisce feature maps ai layer specificati.
-    I pesi sono SEMPRE congelati (require_grad=False).
+    Il modello VGG16 è caricato con pesi ImageNet, troncato all'ultimo
+    layer necessario e completamente frozen (no gradient flow).
 
-    Args:
-        layers:    Lista nomi layer da estrarre
-                   (sottoinsieme di _VGG_LAYERS).
-        normalize: Se True, normalizza l'input con statistiche ImageNet
-                   prima di passarlo a VGG19. Usare True se l'input
-                   è in [0,1] sRGB, False se è già normalizzato.
+    Il forward ritorna un dizionario layer_name → feature_map.
     """
 
-    # Mappa nome layer → indice nel modello VGG19 sequenziale
-    _LAYER_MAP = {
-        "relu1_1":  1,
-        "relu1_2":  3,
-        "relu2_1":  6,
-        "relu2_2":  8,
-        "relu3_1": 11,
-        "relu3_2": 13,
-        "relu3_3": 15,
-        "relu3_4": 17,
-        "relu4_1": 20,
-        "relu4_2": 22,
-        "relu4_3": 24,
-        "relu4_4": 26,
-    }
-
-    def __init__(
-        self,
-        layers: List[str] = None,
-        normalize: bool = True,
-    ) -> None:
+    def __init__(self):
         super().__init__()
 
-        layers = layers or _VGG_LAYERS
+        # Carica VGG16 pre-addestrata, prendi solo i features
+        vgg = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
+        features = vgg.features
 
-        # Verifica che tutti i layer richiesti siano validi
-        for l in layers:
-            if l not in self._LAYER_MAP:
-                raise ValueError(
-                    f"Layer VGG19 '{l}' non riconosciuto. "
-                    f"Validi: {list(self._LAYER_MAP.keys())}"
-                )
+        # Tronca al massimo indice necessario (relu3_3 = indice 15 → +1)
+        max_idx = max(_VGG_LAYER_INDICES.values()) + 1
+        self.features = nn.Sequential(*list(features.children())[:max_idx])
 
-        self.layers    = layers
-        self.normalize = normalize
+        # Congela tutti i parametri
+        for param in self.parameters():
+            param.requires_grad_(False)
 
-        # Carica VGG19 pre-addestrato
-        try:
-            import torchvision.models as tvm
-            vgg = tvm.vgg19(weights=tvm.VGG19_Weights.IMAGENET1K_V1)
-        except Exception:
-            try:
-                import torchvision.models as tvm
-                vgg = tvm.vgg19(pretrained=True)
-            except Exception as e:
-                raise ImportError(
-                    f"torchvision è richiesto per PerceptualLoss: {e}"
-                )
+        # Registra i layer di interesse per hook
+        self._layer_outputs: Dict[str, torch.Tensor] = {}
+        self._register_hooks()
 
-        # Tronca il modello al layer massimo richiesto
-        max_idx = max(self._LAYER_MAP[l] for l in layers)
-        self._features = nn.Sequential(
-            *list(vgg.features.children())[:max_idx + 1]
+        # Buffer per normalizzazione ImageNet
+        self.register_buffer(
+            "imagenet_mean",
+            _IMAGENET_MEAN.view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "imagenet_std",
+            _IMAGENET_STD.view(1, 3, 1, 1),
         )
 
-        # Congela TUTTI i parametri
-        for p in self._features.parameters():
-            p.requires_grad = False
+    def _register_hooks(self):
+        """Registra forward hook per catturare output ai layer target."""
+        children = list(self.features.children())
+        for name, idx in _VGG_LAYER_INDICES.items():
+            # Closure per catturare `name`
+            def make_hook(layer_name):
+                def hook(module, input, output):
+                    self._layer_outputs[layer_name] = output
+                return hook
+            children[idx].register_forward_hook(make_hook(name))
 
-        self._max_idx = max_idx
-
-        # Registra le statistiche ImageNet come buffer (segue il device del modello)
-        self.register_buffer("_mean", _VGG_MEAN)
-        self.register_buffer("_std",  _VGG_STD)
-
-        logger.info(
-            f"VGG19Features inizializzato — layers={layers}, "
-            f"normalize={normalize}, frozen=True"
-        )
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def normalize(self, img: torch.Tensor) -> torch.Tensor:
         """
-        Estrae feature maps ai layer specificati.
+        Normalizza un'immagine sRGB [0,1] con le statistiche ImageNet.
 
         Args:
-            x: (B, 3, H, W) in [0,1] se normalize=True,
-               o già normalizzato ImageNet se normalize=False.
+            img: (B, 3, H, W) float32, valori in [0,1].
 
         Returns:
-            Dizionario {nome_layer: feature_map}.
+            (B, 3, H, W) float32 normalizzato.
         """
-        if self.normalize:
-            x = (x - self._mean) / self._std
+        mean = self.imagenet_mean.to(img.device, img.dtype)
+        std  = self.imagenet_std.to(img.device, img.dtype)
+        return (img - mean) / (std + EPS)
 
-        features: Dict[str, torch.Tensor] = {}
-        layer_indices = {self._LAYER_MAP[l]: l for l in self.layers}
+    def forward(self, img: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Estrae feature maps da VGG16.
 
-        out = x
-        for i, module in enumerate(self._features):
-            out = module(out)
-            if i in layer_indices:
-                features[layer_indices[i]] = out
+        Args:
+            img: (B, 3, H, W) float32, sRGB in [0,1].
 
-        return features
+        Returns:
+            Dict layer_name → feature_map (B, C_l, H_l, W_l) float32.
+        """
+        self._layer_outputs.clear()
+        x = self.normalize(img.float())
+        self.features(x)  # forward — gli hook popolano _layer_outputs
+        # Copia per evitare che il dizionario venga sovrascritto al prossimo call
+        return {k: v for k, v in self._layer_outputs.items()}
 
 
 class PerceptualLoss(nn.Module):
     """
-    Perceptual Loss basata su feature VGG19  (§6.4.3).
+    Perceptual loss multi-scala tramite feature VGG16.
 
-    L_perc = Σ_l w_l · (1/C_l H_l W_l) ‖φ_l(pred) - φ_l(tgt)‖²_F
+    Calcola la norma di Frobenius normalizzata tra feature maps
+    dell'immagine predetta e del target a relu2_2 e relu3_3 di VGG16.
+    Nessuna gram matrix (la style loss è stata rimossa per ridondanza).
 
-    Args:
-        layers:  Layer VGG19 da usare.
-        weights: Pesi per layer (default [1.0, 0.75, 0.5, 0.25]).
-        normalize: Normalizza input con ImageNet stats.
+    Formula:
+        L_perc = Σ_{l} w_l · (1/C_l H_l W_l) · ‖φ_l(pred) - φ_l(tgt)‖²_F
+
+    Example:
+        >>> loss_fn = PerceptualLoss()
+        >>> pred = torch.rand(2, 3, 384, 512)
+        >>> tgt  = torch.rand(2, 3, 384, 512)
+        >>> loss = loss_fn(pred, tgt)   # scalar tensor
     """
 
-    def __init__(
-        self,
-        layers: List[str] = None,
-        weights: List[float] = None,
-        normalize: bool = True,
-    ) -> None:
+    def __init__(self):
         super().__init__()
-        self.layers  = layers  or _VGG_LAYERS
-        self.weights = weights or _VGG_WEIGHTS
-
-        assert len(self.layers) == len(self.weights), \
-            "layers e weights devono avere la stessa lunghezza"
-
-        self.vgg = VGG19Features(layers=self.layers, normalize=normalize)
+        self.extractor = VGG16FeatureExtractor()
+        # Pesi per layer (§6.5.3): relu2_2=1.0, relu3_3=0.75
+        self.layer_weights = _VGG_LAYER_WEIGHTS
 
     def forward(
         self,
@@ -176,92 +165,27 @@ class PerceptualLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            pred:   (B, 3, H, W) in [0,1].
-            target: (B, 3, H, W) in [0,1].
+            pred:   sRGB (B, 3, H, W) in [0,1].
+            target: sRGB (B, 3, H, W) in [0,1].
 
         Returns:
-            Scalare — perceptual loss pesata.
+            Scalare: somma pesata delle distanze L2 nelle feature spaces.
         """
-        feats_pred   = self.vgg(pred)
-        feats_target = self.vgg(target)
+        # VGG forward su pred e target — in float32
+        feats_pred   = self.extractor(pred)
+        feats_target = self.extractor(target)
 
-        loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        loss = torch.zeros(1, device=pred.device, dtype=torch.float32)
 
-        for layer, w in zip(self.layers, self.weights):
-            fp = feats_pred[layer]
-            ft = feats_target[layer]
+        for layer_name, w in self.layer_weights.items():
+            fp = feats_pred[layer_name]    # (B, C_l, H_l, W_l)
+            ft = feats_target[layer_name]
 
-            # Norma di Frobenius normalizzata per dimensione
+            # Norma di Frobenius normalizzata per numero di elementi
             B, C, H, W = fp.shape
-            norm_factor = C * H * W
+            n_elements = C * H * W
 
-            layer_loss = (fp - ft).pow(2).sum() / (B * norm_factor)
-            loss = loss + w * layer_loss
+            diff_sq = (fp - ft.detach()) ** 2   # target non contribuisce al grad
+            loss = loss + w * diff_sq.sum() / (B * n_elements)
 
         return loss
-
-
-class StyleLoss(nn.Module):
-    """
-    Style Loss con Gram Matrix  (§6.4.4).
-
-    L_style = (1/4) Σ_l ‖G_l(pred) - G_l(tgt)‖²_F
-
-    G_l(I)_{c1,c2} = (1/C_l H_l W_l) Σ_p F_l^{c1}(p) · F_l^{c2}(p)
-
-    Args:
-        layers:    Layer VGG19.
-        normalize: Normalizza input.
-    """
-
-    def __init__(
-        self,
-        layers: List[str] = None,
-        normalize: bool = True,
-    ) -> None:
-        super().__init__()
-        self.layers = layers or _VGG_LAYERS
-        self.vgg    = VGG19Features(layers=self.layers, normalize=normalize)
-
-    @staticmethod
-    def gram_matrix(feat: torch.Tensor) -> torch.Tensor:
-        """
-        Calcola la Gram matrix normalizzata.
-
-        Args:
-            feat: (B, C, H, W)
-
-        Returns:
-            G: (B, C, C)
-        """
-        B, C, H, W = feat.shape
-        # Reshape: (B, C, H*W)
-        f = feat.view(B, C, H * W)
-        # G = (1/CHW) · F · F^T
-        G = torch.bmm(f, f.transpose(1, 2)) / (C * H * W)
-        return G
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            pred:   (B, 3, H, W) in [0,1].
-            target: (B, 3, H, W) in [0,1].
-
-        Returns:
-            Scalare — style loss.
-        """
-        feats_pred   = self.vgg(pred)
-        feats_target = self.vgg(target)
-
-        loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-
-        for layer in self.layers:
-            G_pred = self.gram_matrix(feats_pred[layer])    # (B, C, C)
-            G_tgt  = self.gram_matrix(feats_target[layer])  # (B, C, C)
-            loss   = loss + (G_pred - G_tgt).pow(2).sum() / G_pred.shape[0]
-
-        return loss / 4.0
