@@ -95,34 +95,21 @@ class ClusterNet(nn.Module):
     # ------------------------------------------------------------------
     def reinitialise_from_centroids(
         self,
-        centroids: torch.Tensor,
+        centroids: torch.Tensor,   # (K, 192)
         freeze_after: bool = False,
     ) -> None:
-        """
-        Reinizializza il layer di output con i centroidi K-Means.
-
-        I pesi fc2 vengono impostati in modo che, all'inizio del
-        few-shot adaptation, l'output del ClusterNet sia allineato
-        con l'assignment K-Means calcolato sui color histograms.
-
-        Parameters
-        ----------
-        centroids    : (K, input_dim) centroidi K-Means sui histograms
-        freeze_after : se True, congela i parametri dopo la reinizializzazione
-                       (utile se si vuole mantenere l'assignment fisso)
-        """
         K, D = centroids.shape
-        assert K == self.n_clusters, (
-            f"Centroids K={K} ≠ ClusterNet n_clusters={self.n_clusters}"
-        )
+        assert K == self.n_clusters
+        assert D == self.input_dim, f"Centroids dim {D} != input_dim {self.input_dim}"
 
-        # Proietta i centroidi nello spazio nascosto tramite fc1 (frozen al momento)
-        # e imposta fc2 per avvicinarsi all'output K-Means
+        # Proietta i centroidi nello spazio hidden tramite fc1 (già inizializzato)
+        # e inizializza fc2 in modo che l'output sia allineato con K-Means
         with torch.no_grad():
-            # Stategia semplice: inizializza fc2 con centroidi normalizzati
-            # come proxy di "distanza dal centroide"
-            centroids_norm = F.normalize(centroids.float(), dim=-1)
-            self.fc2.weight.data = centroids_norm
+            # Passa i centroidi attraverso fc1 per ottenere rappresentazioni (K, 256)
+            hidden = F.relu(self.fc1(centroids.float()))   # (K, 256)
+            # Inizializza fc2 come classificatore lineare sui centroidi proiettati
+            hidden_norm = F.normalize(hidden, dim=-1)      # (K, 256)
+            self.fc2.weight.data = hidden_norm
             self.fc2.bias.data   = torch.zeros(K)
 
         if freeze_after:
