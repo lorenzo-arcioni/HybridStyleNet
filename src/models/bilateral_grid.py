@@ -1,312 +1,432 @@
 """
-models/bilateral_grid.py
+bilateral_grid.py
+-----------------
+Bilateral Grid Renderer — Componente 4 di RAG-ColorNet.
 
-Bilateral Grid + Trilinear Slicing  (§6.3).
+Converte il retrieved edit (spazio feature DINOv2) in trasformazioni
+affini pixel-wise applicate tramite bilateral grid slicing edge-aware.
 
 Struttura:
-  G ∈ R^(B, 12, H_g, W_g, L_b)
-    12  = coefficienti affini 3×3 + bias 3
-    H_g × W_g = risoluzione spaziale della grid (8×8 o 32×32)
-    L_b = 8  bin di luminanza
+  GridNet          : decoder leggero → coefficienti per due bilateral grid
+                     (globale 8×8×8, locale 16×16×8)
+  SemanticGuide    : MLP che produce una guida ibrida chroma+semantica
+  bilateral_slice  : interpolazione trilineare differenziabile
+  BilateralGridRenderer : modulo che orchestra tutto
 
-Il bilateral slicing opera a risoluzione piena (H, W) usando
-coordinate normalizzate → resolution-agnostic.
+Inizializzazione all'identità: entrambi i branch producono la trasformazione
+identità all'inizio del training → nessuna modifica dell'immagine a t=0.
 """
 
-import logging
+from __future__ import annotations
+
 from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
-
-EPS = 1e-8
-
-# Pesi luminanza BT.601 (§6.3)
-_LUM_WEIGHTS = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32)
+from utils.color_utils import rgb_to_lab          # type: ignore[import]
 
 
-# ── Bilateral Grid ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SemanticGuide
+# ---------------------------------------------------------------------------
 
-class BilateralGrid(nn.Module):
+class SemanticGuide(nn.Module):
     """
-    Bilateral Grid differenziabile con slicing trilineare.
+    Produce la guida ibrida g(i,j) ∈ [0,1] per il bilateral slicing.
 
-    La grid codifica una trasformazione affine cromatica per ogni cella
-    (x, y, luminanza). La guida di luminanza rende la trasformazione
-    edge-aware: pixel con luminanza simile ricevono la stessa
-    trasformazione indipendentemente dalla loro posizione.
+    g = α · g_chroma + (1-α) · g_sem
 
-    Args:
-        grid_h:    Risoluzione spaziale verticale della grid.
-        grid_w:    Risoluzione spaziale orizzontale della grid.
-        luma_bins: Numero di bin di luminanza (L_b).
-        in_ch:     Canali input (default 3 = RGB).
-        out_ch:    Canali output (default 3 = RGB).
+    g_chroma : 0.5·L* + 0.25·|a*| + 0.25·|b*| normalizzato
+    g_sem    : σ(MLP(f_sem_patch))  — valore scalare per patch
+
+    Parameters
+    ----------
+    dino_dim    : dimensione embedding DINOv2 patch (384)
+    hidden_dim  : dimensione hidden del MLP (64)
+    alpha       : peso di g_chroma vs g_sem (0.5)
+    patch_size  : patch size DINOv2 (14)
     """
 
     def __init__(
         self,
-        grid_h: int = 8,
-        grid_w: int = 8,
-        luma_bins: int = 8,
-        in_ch: int = 3,
-        out_ch: int = 3,
+        dino_dim:   int   = 384,
+        hidden_dim: int   = 64,
+        alpha:      float = 0.5,
+        patch_size: int   = 14,
     ) -> None:
         super().__init__()
-        self.grid_h    = grid_h
-        self.grid_w    = grid_w
-        self.luma_bins = luma_bins
-        self.in_ch     = in_ch
-        self.out_ch    = out_ch
-        # Coefficienti: matrice (out_ch × in_ch) + bias (out_ch)
-        self.n_coeffs  = out_ch * in_ch + out_ch   # = 12 per RGB→RGB
-
-    def apply(
-        self,
-        grid: torch.Tensor,
-        image: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Applica la bilateral grid a un'immagine tramite slicing trilineare.
-
-        Args:
-            grid:  (B, n_coeffs, grid_h, grid_w, luma_bins)
-                   Coefficienti della trasformazione affine.
-            image: (B, 3, H, W)  immagine sorgente in [0,1].
-                   Usata sia come input della trasformazione
-                   che come guida di luminanza.
-
-        Returns:
-            (B, out_ch, H, W)  immagine trasformata in [0,1].
-        """
-        B, C, H, W = image.shape
-        assert C == self.in_ch, \
-            f"BilateralGrid.apply: atteso {self.in_ch} canali, got {C}"
-
-        # ── 1. Guida di luminanza (§6.3.2) ───────────────────────────────────
-        lum_w = _LUM_WEIGHTS.to(image.device)              # (3,)
-        guide = (image * lum_w[None, :, None, None]).sum(1)  # (B, H, W)
-
-        # ── 2. Coordinate normalizzate nella grid ─────────────────────────────
-        # x_g ∈ [0, grid_w-1], y_g ∈ [0, grid_h-1], l_g ∈ [0, luma_bins-1]
-        # Tutte in coordinate continue per l'interpolazione trilineare
-
-        # Griglia di coordinate pixel (H, W) normalizzate in [0,1]
-        # align_corners=True → 0 mappa al primo bin, 1 all'ultimo
-        grid_y = torch.linspace(0, 1, H, device=image.device)  # (H,)
-        grid_x = torch.linspace(0, 1, W, device=image.device)  # (W,)
-        gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij") # (H, W)
-
-        # Scala alle dimensioni della grid
-        # grid_sample usa [-1, 1] → convertiamo
-        gx_n = gx * 2.0 - 1.0  # (H, W)  ∈ [-1, 1]
-        gy_n = gy * 2.0 - 1.0  # (H, W)  ∈ [-1, 1]
-
-        # Coordinate di luminanza normalizzate in [-1, 1]
-        gl_n = guide * 2.0 - 1.0  # (B, H, W)
-
-        # ── 3. Slicing trilineare ─────────────────────────────────────────────
-        # Usiamo F.grid_sample con griglia 5-D (B, H, W, 1, 3) per 3-D input
-        # La grid 5-D ha shape (B, H, W, 1, 3): (x, y, z) coordinate
-
-        # Espandi le coordinate spaziali al batch
-        gx_b = gx_n[None, :, :].expand(B, H, W)   # (B, H, W)
-        gy_b = gy_n[None, :, :].expand(B, H, W)   # (B, H, W)
-
-        # Griglia campionamento: (B, H, W, 1, 3) — (x_spatial, y_spatial, luma)
-        sample_grid = torch.stack(
-            [gx_b, gy_b, gl_n], dim=-1
-        ).unsqueeze(3)  # (B, H, W, 1, 3)
-
-        # grid ha shape (B, n_coeffs, luma_bins, grid_h, grid_w)
-        # grid_sample 3-D: input (B, C, D, H, W), grid (B, H_out, W_out, D_out, 3)
-        # Riorganizza grid: (B, n_coeffs, luma_bins, grid_h, grid_w)
-        G = grid  # già nel formato corretto
-
-        # sample_grid deve avere shape (B, H, W, 1, 3) con ordine (x, y, z)
-        # dove x = dimensione W della grid, y = dimensione H, z = luma
-        # F.grid_sample 5D: input (B,C,D,H,W) grid (B,Ho,Wo,Do,3) → (B,C,Ho,Wo,Do)
-        coeffs = F.grid_sample(
-            G,                                  # (B, n_coeffs, luma_bins, grid_h, grid_w)
-            sample_grid,                        # (B, H, W, 1, 3)
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=True,
-        )  # → (B, n_coeffs, H, W, 1)
-
-        coeffs = coeffs.squeeze(-1)             # (B, n_coeffs, H, W)
-
-        # ── 4. Trasformazione affine pixel-wise (§6.3.4) ──────────────────────
-        out_ch  = self.out_ch
-        in_ch   = self.in_ch
-        n_mat   = out_ch * in_ch
-
-        A = coeffs[:, :n_mat, :, :]              # (B, out*in, H, W)
-        b = coeffs[:, n_mat:, :, :]              # (B, out_ch, H, W)
-
-        # Reshape A: (B, out_ch, in_ch, H, W)
-        A = A.view(B, out_ch, in_ch, H, W)
-
-        # image: (B, in_ch, H, W) → (B, 1, in_ch, H, W)
-        img_exp = image.unsqueeze(1)             # (B, 1, in_ch, H, W)
-
-        # Moltiplicazione matrice-vettore per pixel
-        # (B, out_ch, in_ch, H, W) * (B, 1, in_ch, H, W) → somma su in_ch
-        out = (A * img_exp).sum(dim=2) + b       # (B, out_ch, H, W)
-
-        return out.clamp(0.0, 1.0)
-
-    def forward(
-        self,
-        grid: torch.Tensor,
-        image: torch.Tensor,
-    ) -> torch.Tensor:
-        """Alias di apply() per uso come modulo nn."""
-        return self.apply(grid, image)
-
-
-# ── Grid Predictor ────────────────────────────────────────────────────────────
-
-class GlobalGridPredictor(nn.Module):
-    """
-    Predice la Bilateral Grid globale (8×8×L_b) da feature globali.
-
-    Input:  vettore globale f ∈ R^(B, in_features)  (dopo GAP)
-    Output: G_global ∈ R^(B, 12, L_b, grid_h, grid_w)
-
-    Args:
-        in_features: Dimensione del vettore input (es. 512 da P5 GAP).
-        grid_h:      Risoluzione verticale grid.
-        grid_w:      Risoluzione orizzontale grid.
-        luma_bins:   Numero bin luminanza.
-        hidden_dim:  Dimensione layer nascosto MLP.
-    """
-
-    def __init__(
-        self,
-        in_features: int = 512,
-        grid_h: int = 8,
-        grid_w: int = 8,
-        luma_bins: int = 8,
-        hidden_dim: int = 256,
-        out_ch: int = 3,
-        in_ch: int = 3,
-    ) -> None:
-        super().__init__()
-
-        self.grid_h    = grid_h
-        self.grid_w    = grid_w
-        self.luma_bins = luma_bins
-        self.n_coeffs  = out_ch * in_ch + out_ch
-
-        n_out = self.n_coeffs * grid_h * grid_w * luma_bins
+        self.alpha      = alpha
+        self.patch_size = patch_size
 
         self.mlp = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
+            nn.Linear(dino_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, n_out),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
         )
 
-        # Inizializza l'ultimo layer vicino a zero
-        # → la grid parte vicino all'identità
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
-
-        # Bias identità: matrice 3×3 = I, bias = 0
-        # Coefficienti in ordine: [R→R, R→G, R→B, G→R, G→G, G→B, B→R, B→G, B→B,
-        #                          bias_R, bias_G, bias_B]
-        # Inizializziamo i bias della matrice all'identità
-        with torch.no_grad():
-            identity_coeffs = torch.zeros(self.n_coeffs)
-            identity_coeffs[0] = 1.0   # R→R
-            identity_coeffs[4] = 1.0   # G→G
-            identity_coeffs[8] = 1.0   # B→B
-            # Replicate su tutti le celle della grid
-            bias_val = identity_coeffs.repeat(
-                grid_h * grid_w * luma_bins
-            )
-            self.mlp[-1].bias.data = bias_val
-
-    def forward(self, f: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    def _chroma_guide(self, img: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            f: (B, in_features)
+        Guida cromatica basata su Lab.
+        g_chroma(i,j) = (0.5·L* + 0.25·|a*| + 0.25·|b*|) / 114.0
 
-        Returns:
-            (B, n_coeffs, luma_bins, grid_h, grid_w)
+        Returns
+        -------
+        g_chroma : (B, H, W) ∈ [0, 1]
         """
-        B = f.shape[0]
-        out = self.mlp(f)   # (B, n_coeffs * grid_h * grid_w * luma_bins)
-        return out.view(B, self.n_coeffs, self.luma_bins,
-                        self.grid_h, self.grid_w)
+        lab = rgb_to_lab(img)                     # (B, 3, H, W)
+        L   = lab[:, 0, :, :]
+        a   = lab[:, 1, :, :].abs()
+        b   = lab[:, 2, :, :].abs()
+        g   = (0.5 * L + 0.25 * a + 0.25 * b) / 114.0
+        return g.clamp(0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        img:   torch.Tensor,   # (B, 3, H, W) sRGB [0,1]
+        F_sem: torch.Tensor,   # (B, N, 384)  patch tokens DINOv2
+        n_h:   int,
+        n_w:   int,
+    ) -> torch.Tensor:
+        """
+        Returns
+        -------
+        g : (B, H, W)  guida ibrida ∈ [0, 1]
+        """
+        B, C, H, W = img.shape
+
+        # Guida cromatica
+        g_chroma = self._chroma_guide(img)        # (B, H, W)
+
+        # Guida semantica: MLP per patch → upsample a pixel
+        g_sem_patch = self.mlp(F_sem)             # (B, N, 1)
+        g_sem_patch = g_sem_patch.reshape(B, n_h, n_w, 1).permute(0, 3, 1, 2)
+        # Upsample a piena risoluzione
+        g_sem = F.interpolate(
+            g_sem_patch, size=(H, W),
+            mode="bilinear", align_corners=False,
+        ).squeeze(1)                              # (B, H, W)
+
+        return self.alpha * g_chroma + (1.0 - self.alpha) * g_sem
 
 
-class LocalGridPredictor(nn.Module):
+# ---------------------------------------------------------------------------
+# bilateral_slice  (differenziabile)
+# ---------------------------------------------------------------------------
+
+def bilateral_slice(
+    grid:  torch.Tensor,    # (B, n_coeff, s_spatial, s_spatial, s_lum)
+    img:   torch.Tensor,    # (B, 3, H, W)
+    guide: torch.Tensor,    # (B, H, W) ∈ [0, 1]
+) -> torch.Tensor:
     """
-    Predice la Bilateral Grid locale (32×32×L_b) da feature spaziali.
+    Interpolazione trilineare differenziabile sulla bilateral grid.
 
-    Input:  feature map x ∈ R^(B, in_channels, H', W')  (da SPADEResBlock)
-    Output: G_local ∈ R^(B, 12, L_b, 32, 32)
+    Per ogni pixel (i,j):
+      coords = (j/(W-1)·(s-1), i/(H-1)·(s-1), guide(i,j)·(l-1))
+      coeffs = trilinear_interp(grid, coords)
+      out(i,j) = A_ij · img(i,j) + b_ij
 
-    Usa AdaptiveAvgPool per portare qualsiasi (H', W') a (32, 32)
-    → resolution-agnostic.
+    La grid ha n_coeff=12 → 3×3 matrice affine (A) + 3 bias (b).
 
-    Args:
-        in_channels: Canali input (es. 256 da x3).
-        grid_h:      Risoluzione verticale grid (default 32).
-        grid_w:      Risoluzione orizzontale grid (default 32).
-        luma_bins:   Numero bin luminanza.
+    Parameters
+    ----------
+    grid  : bilateral grid con coefficienti affini
+    img   : immagine sorgente
+    guide : guida di slicing ∈ [0,1]
+
+    Returns
+    -------
+    out : (B, 3, H, W)  immagine trasformata
+    """
+    B, n_coeff, s_sp, _, s_lum = grid.shape
+    _, _, H, W = img.shape
+
+    # Coordinate normalizzate per grid_sample: range [-1, 1]
+    # x_spatial:  j / (W-1) → [-1, 1]
+    # y_spatial:  i / (H-1) → [-1, 1]
+    # z_lum:      guide      → [-1, 1]
+
+    # Griglia di coordinate pixel (H × W)
+    y_coords = torch.linspace(-1, 1, H, device=img.device)  # (H,)
+    x_coords = torch.linspace(-1, 1, W, device=img.device)  # (W,)
+    yy, xx   = torch.meshgrid(y_coords, x_coords, indexing="ij")
+
+    # Coordinate di luminanza dalla guida: (B, H, W) → [-1, 1]
+    zz = guide * 2.0 - 1.0                       # (B, H, W)
+
+    # grid_sample richiede: (B, H, W, 3) con ordine (x, y, z)
+    # Per un volume (D, H, W): coords = (x_w, y_h, z_d)
+    # Qui il volume è (s_lum, s_sp, s_sp): depth=lum, height=sp, width=sp
+    xx_exp = xx.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
+    yy_exp = yy.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
+
+    sample_coords = torch.stack(
+        [xx_exp, yy_exp, zz], dim=-1              # (B, H, W, 3)
+    )
+
+    # Interpola tutti i canali della grid contemporaneamente
+    # grid_sample input: (B, C, D, H, W) — riordiniamo la grid
+    # grid attuale: (B, n_coeff, s_sp, s_sp, s_lum)
+    # grid_sample si aspetta: (B, C, D, H, W) con D=depth(lum), H=sp, W=sp
+    grid_5d = grid.permute(0, 1, 4, 2, 3)        # (B, n_coeff, s_lum, s_sp, s_sp)
+
+    coeffs = F.grid_sample(
+        grid_5d,
+        sample_coords.unsqueeze(1).expand(-1, n_coeff, -1, -1, -1)
+        .reshape(B * n_coeff, 1, H, W, 3),
+        mode="bilinear", align_corners=True, padding_mode="border",
+    )
+    # Risultato: (B*n_coeff, 1, H, W) → (B, n_coeff, H, W)
+    coeffs = coeffs.reshape(B, n_coeff, H, W)
+
+    # Applica trasformazione affine: A (3×3) + b (3)
+    # coeffs[:, :9]  → A (matrice 3×3 reshapata)
+    # coeffs[:, 9:]  → b (bias 3)
+    A = coeffs[:, :9, :, :]                       # (B, 9, H, W)
+    b = coeffs[:, 9:, :, :]                       # (B, 3, H, W)
+
+    # Applica: out_c = Σ_k A[c,k] · img[k] + b[c]
+    img_flat = img.reshape(B, 3, H * W)           # (B, 3, H*W)
+    A_mat    = A.reshape(B, 3, 3, H * W)          # (B, 3, 3, H*W)
+
+    out_flat = torch.einsum("bckhw,bkhw->bchw", A_mat.reshape(B, 3, 3, H, W), img)
+    out      = out_flat + b
+
+    return out                                    # (B, 3, H, W)
+
+
+# ---------------------------------------------------------------------------
+# GridNet
+# ---------------------------------------------------------------------------
+
+class GridNet(nn.Module):
+    """
+    Decoder leggero che produce i coefficienti delle due bilateral grid
+    a partire dal retrieved edit e dalle feature DINOv2.
+
+    Branch globale  → G_global (B, 12, 8,  8,  8)
+    Branch locale   → G_local  (B, 12, 16, 16, 8)
+
+    Entrambi i branch sono inizializzati per produrre la trasformazione
+    identità: A = I_3, b = 0.
+
+    Parameters
+    ----------
+    retrieval_dim : dimensione del retrieved edit (d_r = 256)
+    dino_dim      : dimensione embedding DINOv2 (384)
+    dino_proj_dim : proiezione DINOv2 nell'encoder (128)
+    fusion_dim    : dimensione after fusion (256)
+    global_s      : spatial resolution della grid globale (8)
+    global_l      : luminance bins grid globale (8)
+    local_s       : spatial resolution della grid locale (16)
+    local_l       : luminance bins grid locale (8)
+    n_affine      : coefficienti affini per bin (12 = 3×3 + 3)
     """
 
     def __init__(
         self,
-        in_channels: int = 256,
-        grid_h: int = 32,
-        grid_w: int = 32,
-        luma_bins: int = 8,
-        out_ch: int = 3,
-        in_ch: int = 3,
+        retrieval_dim: int = 256,
+        dino_dim:      int = 384,
+        dino_proj_dim: int = 128,
+        fusion_dim:    int = 256,
+        global_s:      int = 8,
+        global_l:      int = 8,
+        local_s:       int = 16,
+        local_l:       int = 8,
+        n_affine:      int = 12,
     ) -> None:
         super().__init__()
+        self.global_s = global_s
+        self.global_l = global_l
+        self.local_s  = local_s
+        self.local_l  = local_l
+        self.n_affine = n_affine
 
-        self.grid_h    = grid_h
-        self.grid_w    = grid_w
-        self.luma_bins = luma_bins
-        self.n_coeffs  = out_ch * in_ch + out_ch
+        # Proiezione DINOv2 384 → 128
+        self.dino_proj = nn.Conv2d(dino_dim, dino_proj_dim, kernel_size=1)
 
-        # AdaptiveAvgPool → (32, 32) resolution-agnostic
-        self.pool = nn.AdaptiveAvgPool2d((grid_h, grid_w))
-
-        # Convoluzione 1×1 per predire i coefficienti
-        # Output: (B, n_coeffs * luma_bins, grid_h, grid_w)
-        n_out_ch = self.n_coeffs * luma_bins
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, n_out_ch, kernel_size=1, bias=True),
+        # Fusione: retrieval (d_r=256) + dino_proj (128) → fusion_dim (256)
+        self.fusion_conv = nn.Conv2d(
+            retrieval_dim + dino_proj_dim, fusion_dim, kernel_size=1
         )
 
-        # Inizializzazione identità
-        nn.init.zeros_(self.conv[0].weight)
-        with torch.no_grad():
-            identity_coeffs = torch.zeros(self.n_coeffs)
-            identity_coeffs[0] = 1.0
-            identity_coeffs[4] = 1.0
-            identity_coeffs[8] = 1.0
-            bias_val = identity_coeffs.repeat(luma_bins)
-            self.conv[0].bias.data = bias_val
+        # Branch globale: GAP → MLP → reshape
+        global_out = n_affine * global_s * global_s * global_l
+        self.global_branch = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(fusion_dim, global_out),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, in_channels, H', W')  — qualsiasi H', W'
+        # Branch locale: AdaptiveAvgPool(16×16) → Conv1x1 → reshape
+        local_out = n_affine * local_l
+        self.local_pool = nn.AdaptiveAvgPool2d((local_s, local_s))
+        self.local_conv = nn.Conv2d(fusion_dim, local_out, kernel_size=1)
 
-        Returns:
-            (B, n_coeffs, luma_bins, grid_h, grid_w)
+        self._init_identity()
+
+    # ------------------------------------------------------------------
+    def _init_identity(self) -> None:
         """
-        B = x.shape[0]
-        pooled = self.pool(x)   # (B, in_channels, grid_h, grid_w)
-        out    = self.conv(pooled)  # (B, n_coeffs*luma_bins, grid_h, grid_w)
-        return out.view(B, self.n_coeffs, self.luma_bins,
-                        self.grid_h, self.grid_w)
+        Inizializza l'ultimo layer di ogni branch per produrre
+        la trasformazione identità: A = I_3, b = 0.
+
+        identity_coeffs = [1,0,0, 0,1,0, 0,0,1, 0,0,0] × (s×s×l)
+        """
+        identity = torch.tensor(
+            [1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0.],
+            dtype=torch.float32,
+        )
+
+        # Global branch — ultimo Linear
+        last_global = self.global_branch[-1]
+        nn.init.zeros_(last_global.weight)
+        total_global = self.global_s * self.global_s * self.global_l
+        last_global.bias.data = identity.repeat(total_global)
+
+        # Local branch — local_conv
+        nn.init.zeros_(self.local_conv.weight)
+        total_local = self.local_l
+        self.local_conv.bias.data = identity.repeat(total_local)
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        R_spatial: torch.Tensor,   # (B, d_r,      n_h, n_w)
+        F_sem:     torch.Tensor,   # (B, dino_dim, n_h, n_w) — già in forma spaziale
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns
+        -------
+        G_global : (B, n_affine, global_s, global_s, global_l)
+        G_local  : (B, n_affine, local_s,  local_s,  local_l)
+        """
+        B = R_spatial.shape[0]
+
+        # F_sem in forma spaziale: (B, dino_dim, n_h, n_w)
+        F_sem_proj = self.dino_proj(F_sem)        # (B, 128, n_h, n_w)
+
+        # Fusione retrieved edit + DINOv2
+        F_fused = self.fusion_conv(
+            torch.cat([R_spatial, F_sem_proj], dim=1)
+        )                                         # (B, 256, n_h, n_w)
+
+        # --- Branch globale ---
+        f_gap = F_fused.mean(dim=[-2, -1])        # (B, 256) global avg pool
+        G_global_flat = self.global_branch(f_gap) # (B, 12 * 8 * 8 * 8)
+        G_global = G_global_flat.reshape(
+            B, self.n_affine, self.global_s, self.global_s, self.global_l
+        )
+
+        # --- Branch locale ---
+        F_local_pooled = self.local_pool(F_fused) # (B, 256, 16, 16)
+        G_local_flat   = self.local_conv(F_local_pooled)  # (B, 12*8, 16, 16)
+        # reshape: (B, 12*8, 16, 16) → (B, 12, 16, 16, 8)
+        G_local = G_local_flat.reshape(
+            B, self.n_affine, self.local_l, self.local_s, self.local_s
+        ).permute(0, 1, 3, 4, 2).contiguous()
+
+        return G_global, G_local
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_config(cls, cfg: dict) -> "GridNet":
+        bcfg = cfg["bilateral_grid"]
+        rcfg = cfg["retrieval"]
+        ecfg = cfg["encoder"]
+        return cls(
+            retrieval_dim = rcfg["d_r"],
+            dino_dim      = ecfg["embed_dim"],
+            dino_proj_dim = bcfg["dino_proj_dim"],
+            fusion_dim    = bcfg["fusion_dim"],
+            global_s      = bcfg["global_s"],
+            global_l      = bcfg["global_l"],
+            local_s       = bcfg["local_s"],
+            local_l       = bcfg["local_l"],
+            n_affine      = bcfg["n_affine_coeffs"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# BilateralGridRenderer  (modulo principale del componente 4)
+# ---------------------------------------------------------------------------
+
+class BilateralGridRenderer(nn.Module):
+    """
+    Orchestrazione completa del rendering via bilateral grid.
+
+    Espone:
+      - GridNet per predire i coefficienti
+      - SemanticGuide per la guida ibrida
+      - bilateral_slice per applicare le trasformazioni
+
+    Returns
+    -------
+    I_global : (B, 3, H, W)  immagine trasformata dalla grid globale
+    I_local  : (B, 3, H, W)  immagine trasformata dalla grid locale
+    G_global : (B, 12, 8,  8,  8)  coefficienti grid globale (per TV loss)
+    G_local  : (B, 12, 16, 16, 8)  coefficienti grid locale  (per TV loss)
+    g        : (B, H, W)     guida di slicing (per debug)
+    """
+
+    def __init__(
+        self,
+        grid_net:   GridNet,
+        guide:      SemanticGuide,
+    ) -> None:
+        super().__init__()
+        self.grid_net = grid_net
+        self.guide    = guide
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        R_spatial: torch.Tensor,   # (B, d_r, n_h, n_w)
+        F_sem:     torch.Tensor,   # (B, N,  dino_dim) — patch tokens
+        img:       torch.Tensor,   # (B, 3, H, W)
+        n_h:       int,
+        n_w:       int,
+    ) -> dict:
+        B, _, H, W = img.shape
+
+        # F_sem (B, N, D) → forma spaziale (B, D, n_h, n_w) per GridNet
+        F_sem_spatial = F_sem.permute(0, 2, 1).reshape(
+            B, F_sem.shape[-1], n_h, n_w
+        )
+
+        # Predici i coefficienti delle bilateral grid
+        G_global, G_local = self.grid_net(R_spatial, F_sem_spatial)
+
+        # Guida ibrida
+        g = self.guide(img, F_sem, n_h, n_w)      # (B, H, W)
+
+        # Bilateral slicing
+        I_global = bilateral_slice(G_global, img, g)
+        I_local  = bilateral_slice(G_local,  img, g)
+
+        return {
+            "I_global": I_global,
+            "I_local":  I_local,
+            "G_global": G_global,
+            "G_local":  G_local,
+            "guide":    g,
+        }
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_config(cls, cfg: dict) -> "BilateralGridRenderer":
+        grid_net = GridNet.from_config(cfg)
+        bcfg     = cfg["bilateral_grid"]
+        ecfg     = cfg["encoder"]
+        guide    = SemanticGuide(
+            dino_dim   = ecfg["embed_dim"],
+            hidden_dim = bcfg["guide_hidden"],
+            alpha      = bcfg["guide_alpha"],
+            patch_size = ecfg["patch_size"],
+        )
+        return cls(grid_net=grid_net, guide=guide)

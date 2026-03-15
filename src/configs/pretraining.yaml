@@ -1,0 +1,100 @@
+# ============================================================
+# RAG-ColorNet — Pre-Training Config (Phase 1)
+# Overrides base.yaml. Trains on FiveK + PPR10K + Lightroom
+# presets to learn general retrieval and rendering priors.
+# ============================================================
+
+# ------------------------------------------------------------
+# Datasets
+# ------------------------------------------------------------
+data:
+  datasets:
+    fivek:
+      enabled:      true
+      root:         "data/fivek/"
+      n_experts:    5                            # retouchers A–E
+      pairs_per_expert: 1000                     # up to 5K pairs total
+      # which expert(s) to use; null = all
+      experts:      null
+
+    ppr10k:
+      enabled:      true
+      root:         "data/ppr10k/"
+      use_masks:    false                        # portrait masks (optional)
+
+    lightroom_presets:
+      enabled:      true
+      root:         "data/lightroom_presets/"
+      n_presets:    500
+      n_base_images: 200                         # synthetic pairs per preset
+      # synthetic = apply preset to base image programmatically
+
+  # Combined loader settings
+  shuffle:          true
+  train_resolution: [512, 384]
+  keep_aspect:      true
+  augment:          true
+
+# ------------------------------------------------------------
+# Augmentations (phase 1 only — broad diversity)
+# ------------------------------------------------------------
+augmentation:
+  random_flip_h:    0.5
+  random_crop:      true
+  crop_scale:       [0.8, 1.0]
+  color_jitter:     false                        # avoid corrupting Lab targets
+  random_rotation:  5                            # degrees
+
+# ------------------------------------------------------------
+# Trainable modules during pre-training
+# ------------------------------------------------------------
+trainable_modules:
+  - "retrieval_module"                           # W_Q, W_K, W_V projections
+  - "bilateral_grid"                             # GridNet (global + local)
+  - "confidence_mask"                            # MaskNet
+  - "bilateral_grid.guide_mlp"                   # semantic guide MLP
+  - "cluster_net"                                # generic cluster init (reset in phase 3)
+  # scene_encoder (DINOv2) is ALWAYS frozen — not listed here
+
+frozen_modules:
+  - "scene_encoder"
+
+# ------------------------------------------------------------
+# Optimizer & scheduler
+# ------------------------------------------------------------
+optimizer:
+  lr:               1.0e-4
+  weight_decay:     1.0e-4                       # lighter decay for pre-training
+
+scheduler:
+  warmup_epochs:    3
+  total_epochs:     50
+
+# ------------------------------------------------------------
+# Training loop
+# ------------------------------------------------------------
+training:
+  n_epochs:         50
+  batch_size:       4
+  grad_clip_norm:   1.0
+  val_split:        0.05                         # small val set for monitoring
+  val_split_seed:   0
+
+# ------------------------------------------------------------
+# Loss — simplified pretrain loss (from base.yaml loss.pretrain)
+# ------------------------------------------------------------
+loss_mode:          "pretrain"                   # uses base.yaml loss.pretrain weights
+
+# ------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------
+checkpointing:
+  output_path:      "checkpoints/pretrain_best.pth"
+  save_every_n_epochs: 10
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+logging:
+  run_name:         "pretrain_phase1"
+  log_every_n_steps: 100

@@ -1,230 +1,338 @@
 """
-training/pretrain.py
+pretrain.py
+-----------
+Funzioni riutilizzabili per la Fase 1 (pre-training) e Fase 3
+(few-shot adaptation). Progettate per essere chiamate dai notebook.
 
-Fase 1: Pre-training su FiveK mixed  (§8.2).
+NON contiene un training loop monolitico — espone funzioni granulari:
 
-Obiettivo: imparare la struttura generale di una trasformazione
-fotografica su tutti e 5 gli expert, senza conditioning sullo stile.
+  train_step(model, batch, optimizer, loss_fn, scaler, cluster_db)
+      → LossBreakdown (un singolo batch)
 
-Loss semplificata: L_ΔE + 0.5 * L_perc
-Conditioning disabilitato (prototype = zero vector).
+  val_step(model, batch, loss_fn, cluster_db)
+      → LossBreakdown (no grad)
+
+  run_epoch(model, loader, optimizer, loss_fn, scaler, cluster_db, ...)
+      → dict con metriche medie dell'epoca
+
+  build_optimizer(model, cfg, phase, lr_override)
+      → AdamW configurato per la fase corrente
+
+  build_cluster_db_for_batch(batch_indices, database, faiss_mgr, query_hists)
+      → cluster_db pronto per il forward pass
+
+I notebook orchestrano chiamando run_epoch in loop con early stopping,
+logging e visualizzazione intercalate.
 """
 
-import logging
-import os
-from pathlib import Path
-from typing import Dict, Optional
+from __future__ import annotations
+
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
 
-from data.dataset import FiveKDataset, collate_paired
-from data.raw_pipeline import RawPipeline
-from data.augmentation import PairAugmentation
-from losses.delta_e import DeltaELoss
-from losses.perceptual import PerceptualLoss
-from models.hybrid_style_net import HybridStyleNet
-from utils.checkpoint import save_checkpoint, build_checkpoint_state
-from utils.logging_utils import get_logger, TensorBoardLogger
-
-logger = get_logger(__name__)
+from losses.composite_loss import CompositeLoss, LossBreakdown  # type: ignore[import]
+from memory.database       import PhotographerDatabase           # type: ignore[import]
+from memory.faiss_index    import FAISSIndexManager              # type: ignore[import]
 
 
-class Pretrainer:
+# ---------------------------------------------------------------------------
+# build_optimizer
+# ---------------------------------------------------------------------------
+
+def build_optimizer(
+    model:       nn.Module,
+    cfg:         dict,
+    phase:       str,           # "pretrain" | "adapt_step1" | "adapt_step2"
+    lr_override: Optional[float] = None,
+) -> torch.optim.Optimizer:
     """
-    Fase 1: Pre-training su FiveK mixed.
+    Costruisce un ottimizzatore AdamW per la fase indicata.
 
-    Args:
-        model:         Istanza HybridStyleNet.
-        fivek_root:    Radice dataset FiveK.
-        experts:       Lista expert da includere nel mix.
-        cfg:           Dizionario di configurazione (da default.yaml).
-        device:        Device di training.
-        checkpoint_dir: Directory per i checkpoint.
-        log_dir:       Directory per TensorBoard.
+    Parameters
+    ----------
+    model       : RAGColorNet
+    cfg         : config dict completo
+    phase       : determina il lr di default se lr_override è None
+    lr_override : sovrascrive il lr dal config
+
+    Returns
+    -------
+    AdamW configurato sui soli parametri trainable del modello
     """
+    ocfg = cfg["optimizer"]
 
-    def __init__(
-        self,
-        model: HybridStyleNet,
-        fivek_root: str,
-        experts=None,
-        cfg: Optional[Dict] = None,
-        device: str = "cuda",
-        checkpoint_dir: str = "checkpoints/pretrain",
-        log_dir: str = "logs/pretrain",
-    ) -> None:
-        self.model          = model
-        self.fivek_root     = fivek_root
-        self.experts        = experts or ["A", "B", "C", "D", "E"]
-        self.cfg            = cfg or {}
-        self.device         = torch.device(device)
-        self.checkpoint_dir = checkpoint_dir
+    # Learning rate per fase
+    if lr_override is not None:
+        lr = lr_override
+    elif phase == "pretrain":
+        lr = cfg.get("training", {}).get("lr", 1e-4)
+    elif phase == "adapt_step1":
+        lr = cfg["adaptation"]["lr_step1"]
+    elif phase == "adapt_step2":
+        lr = cfg["adaptation"]["lr_step2"]
+    else:
+        lr = 1e-4
 
-        self.model.to(self.device)
+    # Parametri trainable — esclude DINOv2 frozen
+    params = list(model.trainable_parameters())
 
-        # Loss semplificata (§8.2)
-        self.l_delta_e = DeltaELoss().to(self.device)
-        self.l_perc    = PerceptualLoss().to(self.device)
-        self.perc_weight = 0.5
+    return torch.optim.AdamW(
+        params,
+        lr           = lr,
+        betas        = tuple(ocfg.get("betas", [0.9, 0.999])),
+        eps          = ocfg.get("eps",  1e-8),
+        weight_decay = ocfg.get("weight_decay", 2e-3),
+    )
 
-        # Ottimizzatore
-        opt_cfg = self.cfg.get("optimizer", {})
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=float(opt_cfg.get("lr", 1e-4)),
-            betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
-            eps=float(opt_cfg.get("eps", 1e-8)),
-            weight_decay=float(opt_cfg.get("weight_decay", 1e-4)),
+
+# ---------------------------------------------------------------------------
+# train_step
+# ---------------------------------------------------------------------------
+
+def train_step(
+    model:       nn.Module,
+    batch:       dict,
+    optimizer:   torch.optim.Optimizer,
+    loss_fn:     CompositeLoss,
+    scaler:      GradScaler,
+    cluster_db:  dict,
+    device:      str  = "cuda",
+    grad_clip:   float = 1.0,
+    cluster_labels: Optional[torch.Tensor] = None,
+    edit_target:    Optional[torch.Tensor] = None,
+) -> LossBreakdown:
+    """
+    Singolo step di training su un batch.
+
+    Parameters
+    ----------
+    model         : RAGColorNet in training mode
+    batch         : {"src": Tensor, "tgt": Tensor, ...}
+    optimizer     : ottimizzatore
+    loss_fn       : CompositeLoss con curriculum aggiornato
+    scaler        : GradScaler per fp16
+    cluster_db    : {k: {"keys": ..., "values": ...}} per il retrieval
+    device        : device
+    grad_clip     : norma massima per gradient clipping
+    cluster_labels: (B,) per ClusterAssignmentLoss (opzionale)
+    edit_target   : (B, d_r, n_h, n_w) per RetrievalQualityLoss (opzionale)
+
+    Returns
+    -------
+    LossBreakdown con total e tutti i termini individuali
+    """
+    src = batch["src"].to(device)
+    tgt = batch["tgt"].to(device)
+
+    optimizer.zero_grad(set_to_none=True)
+
+    with autocast(enabled=scaler.is_enabled()):
+        model_out = model(src, cluster_db)
+        breakdown = loss_fn(
+            model_output    = model_out,
+            batch           = {"src": src, "tgt": tgt},
+            cluster_labels  = cluster_labels,
+            edit_target     = edit_target,
         )
 
-        self.grad_clip = float(opt_cfg.get("grad_clip", 1.0))
+    scaler.scale(breakdown.total).backward()
+    scaler.unscale_(optimizer)
+    nn.utils.clip_grad_norm_(model.trainable_parameters(), max_norm=grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
 
-        # AMP
-        self.use_amp = self.cfg.get("hardware", {}).get("amp", True) \
-                       and device == "cuda"
-        self.scaler  = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+    return breakdown
 
-        # Logger
-        self.tb = TensorBoardLogger(log_dir)
-        self._global_step = 0
 
-        logger.info(
-            f"Pretrainer: device={device}, experts={self.experts}, "
-            f"amp={self.use_amp}"
+# ---------------------------------------------------------------------------
+# val_step
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def val_step(
+    model:      nn.Module,
+    batch:      dict,
+    loss_fn:    CompositeLoss,
+    cluster_db: dict,
+    device:     str = "cuda",
+) -> LossBreakdown:
+    """
+    Singolo step di validazione (no grad, no optimizer).
+
+    Parameters
+    ----------
+    model      : RAGColorNet in eval mode
+    batch      : {"src": Tensor, "tgt": Tensor}
+    loss_fn    : CompositeLoss
+    cluster_db : database del fotografo
+    device     : device
+
+    Returns
+    -------
+    LossBreakdown
+    """
+    src = batch["src"].to(device)
+    tgt = batch["tgt"].to(device)
+
+    with autocast(enabled=True):
+        model_out = model(src, cluster_db)
+        breakdown = loss_fn(
+            model_output = model_out,
+            batch        = {"src": src, "tgt": tgt},
         )
 
-    def _build_dataloader(self, batch_size: int, num_workers: int) -> DataLoader:
-        """Costruisce il DataLoader con il mix di tutti gli expert."""
-        pipeline  = RawPipeline(target_long_side=768)
-        augment   = PairAugmentation()
+    return breakdown
 
-        datasets = []
-        for expert in self.experts:
-            try:
-                ds = FiveKDataset(
-                    fivek_root=self.fivek_root,
-                    expert=expert,
-                    split="train",
-                    pipeline=pipeline,
-                    augmentation=augment,
+
+# ---------------------------------------------------------------------------
+# run_epoch
+# ---------------------------------------------------------------------------
+
+def run_epoch(
+    model:       nn.Module,
+    loader:      DataLoader,
+    loss_fn:     CompositeLoss,
+    cluster_db:  dict,
+    device:      str  = "cuda",
+    optimizer:   Optional[torch.optim.Optimizer] = None,
+    scaler:      Optional[GradScaler]            = None,
+    grad_clip:   float = 1.0,
+    phase:       str   = "pretrain",
+    epoch:       int   = 1,
+    cluster_labels_map: Optional[Dict[int, int]] = None,
+) -> dict:
+    """
+    Esegue un'epoca completa di training o validazione.
+
+    Se optimizer è None, esegue solo la validazione (no grad).
+    Chiama loss_fn.update_curriculum(phase, epoch) automaticamente.
+
+    Parameters
+    ----------
+    model       : RAGColorNet
+    loader      : DataLoader del dataset corrente
+    loss_fn     : CompositeLoss
+    cluster_db  : database del fotografo (può essere vuoto in pretrain)
+    device      : device
+    optimizer   : se None → modalità validazione
+    scaler      : GradScaler (creato qui se None in modalità training)
+    grad_clip   : norma massima per gradient clipping
+    phase       : fase corrente (aggiorna il curriculum)
+    epoch       : epoca corrente (aggiorna il curriculum)
+    cluster_labels_map : {pair_idx: cluster_id} per ClusterAssignmentLoss
+
+    Returns
+    -------
+    dict con metriche medie:
+      "loss/total", "loss/delta_e", ..., "n_batches"
+    """
+    is_train = optimizer is not None
+
+    # Aggiorna il curriculum per questa epoca
+    weights = loss_fn.update_curriculum(phase, epoch)
+
+    if is_train:
+        model.train()
+        model.scene_encoder.backbone.eval()       # DINOv2 always eval
+        if scaler is None:
+            scaler = GradScaler(enabled=True)
+    else:
+        model.eval()
+
+    # Accumulatori
+    accum: Dict[str, float] = {}
+    n_batches = 0
+
+    for batch in loader:
+        # Recupera cluster labels se disponibili
+        cluster_labels = None
+        if cluster_labels_map is not None and weights.cluster > 0:
+            idxs = batch.get("idx")
+            if idxs is not None:
+                cluster_labels = torch.tensor(
+                    [cluster_labels_map.get(int(i), 0) for i in idxs],
+                    dtype=torch.long, device=device,
                 )
-                datasets.append(ds)
-            except Exception as e:
-                logger.warning(f"Expert {expert} saltato: {e}")
 
-        if not datasets:
-            raise RuntimeError("Nessun dataset FiveK disponibile per il pre-training.")
-
-        mixed_ds = ConcatDataset(datasets)
-        logger.info(f"Pretrainer dataset: {len(mixed_ds)} coppie totali")
-
-        return DataLoader(
-            mixed_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            collate_fn=collate_paired,
-            drop_last=True,
-        )
-
-    def _zero_prototype(self, batch_size: int) -> torch.Tensor:
-        """Prototype zero (disabilita il conditioning durante il pre-training)."""
-        dim = self.model.set_transformer.output_dim
-        return torch.zeros(batch_size, dim, device=self.device)
-
-    def train(
-        self,
-        epochs: int = 50,
-        batch_size: int = 8,
-        num_workers: int = 4,
-        save_every: int = 5,
-        resume_from: Optional[str] = None,
-    ) -> None:
-        """
-        Esegue il pre-training.
-
-        Args:
-            epochs:      Numero di epoche.
-            batch_size:  Dimensione batch.
-            num_workers: Worker DataLoader.
-            save_every:  Salva checkpoint ogni N epoche.
-            resume_from: Percorso checkpoint da cui riprendere.
-        """
-        start_epoch = 1
-
-        if resume_from:
-            from utils.checkpoint import load_checkpoint
-            state = load_checkpoint(
-                resume_from, self.model, self.optimizer,
-                device=str(self.device)
+        if is_train:
+            breakdown = train_step(
+                model           = model,
+                batch           = batch,
+                optimizer       = optimizer,
+                loss_fn         = loss_fn,
+                scaler          = scaler,
+                cluster_db      = cluster_db,
+                device          = device,
+                grad_clip       = grad_clip,
+                cluster_labels  = cluster_labels,
             )
-            start_epoch = state.get("epoch", 0) + 1
-            logger.info(f"Pretrainer: ripreso dall'epoca {start_epoch}")
+        else:
+            breakdown = val_step(
+                model      = model,
+                batch      = batch,
+                loss_fn    = loss_fn,
+                cluster_db = cluster_db,
+                device     = device,
+            )
 
-        loader = self._build_dataloader(batch_size, num_workers)
+        # Accumula
+        for k, v in breakdown.as_loggable().items():
+            accum[k] = accum.get(k, 0.0) + v
+        n_batches += 1
 
-        for epoch in range(start_epoch, epochs + 1):
-            epoch_loss = self._train_epoch(loader, epoch)
+    # Media sull'epoca
+    metrics = {k: v / max(n_batches, 1) for k, v in accum.items()}
+    metrics["n_batches"] = n_batches
+    return metrics
 
-            logger.info(f"Pretrain Epoch {epoch}/{epochs} — loss={epoch_loss:.4f}")
-            self.tb.log_scalar("pretrain/epoch_loss", epoch_loss, epoch)
 
-            if epoch % save_every == 0 or epoch == epochs:
-                state = build_checkpoint_state(
-                    self.model, self.optimizer,
-                    epoch=epoch,
-                    metrics={"train_loss": epoch_loss},
-                )
-                save_checkpoint(
-                    state,
-                    self.checkpoint_dir,
-                    filename=f"epoch_{epoch:04d}.pth",
-                    is_best=(epoch == epochs),
-                )
+# ---------------------------------------------------------------------------
+# build_empty_cluster_db  (utile in pretrain, dove non c'è database)
+# ---------------------------------------------------------------------------
 
-        self.tb.close()
-        logger.info("Pre-training completato.")
+def build_empty_cluster_db(n_clusters: int) -> dict:
+    """
+    Restituisce un cluster_db vuoto con K cluster None.
+    Usato in pretrain/meta-training dove non esiste un database specifico.
+    """
+    return {k: None for k in range(n_clusters)}
 
-    def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
-        """Esegue un'epoca di training. Restituisce la loss media."""
-        self.model.train()
-        total_loss = 0.0
-        n_batches  = 0
 
-        for batch in loader:
-            src = batch["src"].to(self.device)
-            tgt = batch["tgt"].to(self.device)
-            B   = src.shape[0]
+# ---------------------------------------------------------------------------
+# build_cluster_db_for_batch
+# ---------------------------------------------------------------------------
 
-            # Prototype zero per disabilitare il conditioning
-            prototype = self._zero_prototype(B)
+def build_cluster_db_for_batch(
+    query_hist:  torch.Tensor,          # (B, 192) color histograms del batch
+    database:    PhotographerDatabase,
+    faiss_mgr:   FAISSIndexManager,
+    top_m:       int = 10,
+    device:      str = "cuda",
+) -> dict:
+    """
+    Costruisce il cluster_db per un batch usando FAISS per il top-M retrieval.
 
-            self.optimizer.zero_grad()
+    Versione ottimizzata: usa l'indice FAISS per trovare le top-M immagini
+    per cluster invece di passare tutto il database.
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                out  = self.model(src, prototype=prototype)
-                pred = out["pred"]
+    Parameters
+    ----------
+    query_hist  : color histogram del batch (usa il primo elemento)
+    database    : PhotographerDatabase del fotografo
+    faiss_mgr   : FAISSIndexManager associato
+    top_m       : numero di immagini da recuperare per cluster
+    device      : device per i tensori restituiti
 
-                # Loss semplificata §8.2
-                l_de   = self.l_delta_e(pred, tgt)
-                l_perc = self.l_perc(pred, tgt)
-                loss   = l_de + self.perc_weight * l_perc
-
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            total_loss += loss.item()
-            n_batches  += 1
-            self._global_step += 1
-
-            if self._global_step % 10 == 0:
-                self.tb.log_scalar("pretrain/step_loss", loss.item(),
-                                   self._global_step)
-
-        return total_loss / max(n_batches, 1)
+    Returns
+    -------
+    cluster_db : {k: {"keys": Tensor, "values": Tensor}} per RetrievalModule
+    """
+    return database.get_cluster_db(
+        query_hist = query_hist,
+        top_m      = top_m,
+        device     = device,
+    )

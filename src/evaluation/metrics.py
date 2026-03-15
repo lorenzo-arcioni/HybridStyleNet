@@ -1,358 +1,243 @@
 """
-evaluation/metrics.py
+metrics.py
+----------
+Wrapper per le metriche di valutazione di RAG-ColorNet.
 
-Metriche quantitative per la valutazione  (§9.1):
-  - CIEDE2000 (ΔE₀₀)     §9.1.1
-  - SSIM su canale L*      §9.1.2
-  - LPIPS                  §9.1.3
-  - Delta NIMA             §9.1.4
+Tutte le funzioni accettano batch di tensori (B,3,H,W) float32 [0,1]
+e restituiscono scalari float — pronti per il logging e il confronto
+con lo stato dell'arte.
+
+Metriche:
+  compute_delta_e     — ΔE₀₀ medio (metrica principale)
+  compute_ssim_L      — SSIM sulla luminanza L* (struttura tonale)
+  compute_lpips       — LPIPS perceptual distance
+  compute_nima_delta  — Δ punteggio estetico NIMA (pred vs src)
+  compute_all         — calcola tutte in un colpo solo
+
+Dipendenze opzionali:
+  - pytorch_msssim (per SSIM differenziabile)
+  - lpips           (per LPIPS)
+  - NIMA            (modello estetico — scaricato da torch.hub)
 """
 
-import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from __future__ import annotations
+
+from typing import Dict, Optional
 
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
-from losses.delta_e import DeltaELoss, ciede2000
-from utils.color_space import rgb_to_lab
-
-logger = logging.getLogger(__name__)
+from utils.color_utils import rgb_to_lab, delta_e_2000_mean   # type: ignore[import]
 
 
-@dataclass
-class MetricsResult:
-    """Risultato aggregato della valutazione."""
-    delta_e:       float = 0.0   # CIEDE2000 medio
-    ssim:          float = 0.0   # SSIM su L* medio
-    lpips:         float = 0.0   # LPIPS medio (0 se non disponibile)
-    delta_nima:    float = 0.0   # Δ NIMA score medio (0 se non disponibile)
-    n_samples:     int   = 0
+# ---------------------------------------------------------------------------
+# ΔE₀₀
+# ---------------------------------------------------------------------------
 
-    extras: Dict[str, float] = field(default_factory=dict)
+@torch.no_grad()
+def compute_delta_e(
+    pred: torch.Tensor,   # (B,3,H,W) [0,1]
+    tgt:  torch.Tensor,
+) -> float:
+    """ΔE₀₀ medio sul batch. Metrica principale di RAG-ColorNet."""
+    return delta_e_2000_mean(pred, tgt)
 
-    def __str__(self) -> str:
-        return (
-            f"ΔE₀₀={self.delta_e:.4f} | "
-            f"SSIM={self.ssim:.4f} | "
-            f"LPIPS={self.lpips:.4f} | "
-            f"ΔNIMA={self.delta_nima:.4f} | "
-            f"N={self.n_samples}"
+
+# ---------------------------------------------------------------------------
+# SSIM sulla luminanza L*
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_ssim_L(
+    pred: torch.Tensor,
+    tgt:  torch.Tensor,
+) -> float:
+    """
+    SSIM sulla luminanza L* normalizzata in [0,1].
+
+    Misura la fedeltà strutturale tonale indipendentemente dal colore.
+    Target: > 0.96.
+    """
+    try:
+        from pytorch_msssim import ssim as _ssim
+        L_pred = (rgb_to_lab(pred)[:, 0:1] / 100.0).clamp(0, 1)
+        L_tgt  = (rgb_to_lab(tgt)[:, 0:1]  / 100.0).clamp(0, 1)
+        return _ssim(L_pred, L_tgt, data_range=1.0, size_average=True).item()
+    except ImportError:
+        # Fallback: SSIM manuale su luminanza
+        return _ssim_manual(
+            (rgb_to_lab(pred)[:, 0] / 100.0).clamp(0, 1),
+            (rgb_to_lab(tgt)[:,  0] / 100.0).clamp(0, 1),
         )
 
 
-# ── SSIM ─────────────────────────────────────────────────────────────────────
+def _ssim_manual(x: torch.Tensor, y: torch.Tensor, window: int = 11) -> float:
+    """SSIM minimale in PyTorch per il caso senza pytorch_msssim."""
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    x = x.unsqueeze(1)   # (B,1,H,W)
+    y = y.unsqueeze(1)
 
-def _gaussian_kernel(size: int = 11, sigma: float = 1.5) -> torch.Tensor:
-    """Genera un kernel gaussiano 2D per SSIM."""
-    coords = torch.arange(size, dtype=torch.float32) - size // 2
-    g1d    = torch.exp(-coords ** 2 / (2 * sigma ** 2))
-    g1d    = g1d / g1d.sum()
-    g2d    = torch.outer(g1d, g1d)
-    return g2d.unsqueeze(0).unsqueeze(0)   # (1, 1, size, size)
+    # Gaussian kernel
+    k = window
+    sigma = 1.5
+    coords = torch.arange(k, dtype=torch.float32) - k // 2
+    g1d = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g1d = g1d / g1d.sum()
+    kernel = (g1d.unsqueeze(0) * g1d.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+    kernel = kernel.to(x.device)
 
+    pad = k // 2
+    mu_x = F.conv2d(x, kernel, padding=pad)
+    mu_y = F.conv2d(y, kernel, padding=pad)
 
-def compute_ssim_lstar(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    window_size: int = 11,
-    sigma: float = 1.5,
-    k1: float = 0.01,
-    k2: float = 0.03,
-) -> torch.Tensor:
-    """
-    Calcola SSIM sul canale L* (luminanza) in CIE Lab  (§9.1.2).
+    mu_x2, mu_y2, mu_xy = mu_x ** 2, mu_y ** 2, mu_x * mu_y
+    sig_x  = F.conv2d(x * x, kernel, padding=pad) - mu_x2
+    sig_y  = F.conv2d(y * y, kernel, padding=pad) - mu_y2
+    sig_xy = F.conv2d(x * y, kernel, padding=pad) - mu_xy
 
-    Confronta struttura della luminanza, non dei colori
-    (i colori vengono modificati intenzionalmente dal grading).
-
-    Args:
-        pred:   (B, 3, H, W) in [0,1].
-        target: (B, 3, H, W) in [0,1].
-
-    Returns:
-        (B,) — SSIM per elemento del batch, ∈ [-1, 1].
-    """
-    import torch.nn.functional as F
-
-    # Estrai L* (canale 0 in Lab)
-    pred_lab   = rgb_to_lab(pred.permute(0, 2, 3, 1))
-    target_lab = rgb_to_lab(target.permute(0, 2, 3, 1))
-
-    # L* ∈ [0, 100] → normalizza a [0, 1]
-    L_pred = (pred_lab[..., 0] / 100.0).clamp(0, 1).unsqueeze(1)    # (B,1,H,W)
-    L_tgt  = (target_lab[..., 0] / 100.0).clamp(0, 1).unsqueeze(1)  # (B,1,H,W)
-
-    # Kernel gaussiano
-    kernel = _gaussian_kernel(window_size, sigma).to(pred.device)
-    pad    = window_size // 2
-
-    # Medie locali
-    mu_x = F.conv2d(L_pred, kernel, padding=pad, groups=1)
-    mu_y = F.conv2d(L_tgt,  kernel, padding=pad, groups=1)
-
-    mu_x2 = mu_x * mu_x
-    mu_y2 = mu_y * mu_y
-    mu_xy = mu_x * mu_y
-
-    # Varianze locali
-    sigma_x2 = F.conv2d(L_pred * L_pred, kernel, padding=pad) - mu_x2
-    sigma_y2 = F.conv2d(L_tgt  * L_tgt,  kernel, padding=pad) - mu_y2
-    sigma_xy = F.conv2d(L_pred * L_tgt,  kernel, padding=pad) - mu_xy
-
-    L  = 1.0     # data range
-    C1 = (k1 * L) ** 2
-    C2 = (k2 * L) ** 2
-
-    ssim_map = (
-        (2 * mu_xy + C1) * (2 * sigma_xy + C2)
-    ) / (
-        (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
-    )
-
-    return ssim_map.mean(dim=[1, 2, 3])   # (B,)
+    num = (2 * mu_xy + C1) * (2 * sig_xy + C2)
+    den = (mu_x2 + mu_y2 + C1) * (sig_x + sig_y + C2)
+    return (num / den.clamp(min=1e-8)).mean().item()
 
 
-# ── LPIPS ─────────────────────────────────────────────────────────────────────
-
-class LPIPSMetric:
-    """
-    Wrapper per LPIPS (Learned Perceptual Image Patch Similarity)  (§9.1.3).
-
-    Usa il pacchetto `lpips` se disponibile, altrimenti fallback su
-    una perceptual distance semplificata (VGG features L2).
-    """
-
-    def __init__(self, net: str = "alex", device: str = "cpu") -> None:
-        self._available = False
-        self._fn        = None
-        self.device     = torch.device(device)
-
-        try:
-            import lpips
-            self._fn        = lpips.LPIPS(net=net).to(self.device)
-            self._available = True
-            logger.info("LPIPS: usando pacchetto lpips.")
-        except ImportError:
-            logger.warning(
-                "lpips non installato. LPIPS calcolato con VGG features L2."
-            )
-            self._init_fallback()
-
-    def _init_fallback(self) -> None:
-        """Fallback: distanza L2 su feature VGG relu2_2."""
-        try:
-            from losses.perceptual import VGG19Features
-            self._vgg = VGG19Features(
-                layers=["relu2_2"], normalize=True
-            ).to(self.device)
-            self._available = True
-        except Exception:
-            self._available = False
-
-    @torch.no_grad()
-    def __call__(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            pred:   (B, 3, H, W) in [0,1].
-            target: (B, 3, H, W) in [0,1].
-
-        Returns:
-            (B,) — LPIPS per elemento.
-        """
-        if not self._available:
-            return torch.zeros(pred.shape[0], device=pred.device)
-
-        pred   = pred.to(self.device)
-        target = target.to(self.device)
-
-        if self._fn is not None:
-            # Rescala a [-1, 1] come richiesto da lpips
-            return self._fn(pred * 2 - 1, target * 2 - 1).squeeze()
-        else:
-            # Fallback VGG
-            fp = self._vgg(pred)["relu2_2"]
-            ft = self._vgg(target)["relu2_2"]
-            return (fp - ft).pow(2).mean(dim=[1, 2, 3])
-
-
-# ── NIMA ─────────────────────────────────────────────────────────────────────
-
-class NIMAMetric:
-    """
-    Wrapper per NIMA (Neural Image Assessment)  (§9.1.4).
-
-    Calcola il delta NIMA: μ_NIMA(pred) - μ_NIMA(src).
-    Valori positivi indicano miglioramento estetico rispetto all'originale.
-
-    Usa il pacchetto `nima-pytorch` se disponibile.
-    """
-
-    def __init__(self, device: str = "cpu") -> None:
-        self._available = False
-        self.device     = torch.device(device)
-
-        try:
-            # Tenta import di nima_pytorch o simili
-            import nima_pytorch
-            self._model = nima_pytorch.NIMA().to(self.device)
-            self._available = True
-            logger.info("NIMA: modello caricato.")
-        except ImportError:
-            logger.warning(
-                "nima_pytorch non disponibile. "
-                "Metrica NIMA non calcolata (restituisce 0)."
-            )
-
-    @torch.no_grad()
-    def score(self, img: torch.Tensor) -> torch.Tensor:
-        """
-        Calcola il mean opinion score NIMA.
-
-        Args:
-            img: (B, 3, H, W) in [0,1].
-
-        Returns:
-            (B,) — score ∈ [1, 10].
-        """
-        if not self._available:
-            return torch.zeros(img.shape[0])
-
-        img = img.to(self.device)
-        probs = self._model(img)    # (B, 10)
-        bins  = torch.arange(1, 11, dtype=probs.dtype, device=probs.device)
-        return (probs * bins).sum(dim=1)
-
-    def delta_score(
-        self,
-        pred: torch.Tensor,
-        src: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Calcola Δ_NIMA = μ_NIMA(pred) - μ_NIMA(src).
-
-        Returns:
-            (B,)
-        """
-        return self.score(pred) - self.score(src)
-
-
-# ── Funzioni di valutazione ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# LPIPS
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_batch(
+def compute_lpips(
+    pred:    torch.Tensor,
+    tgt:     torch.Tensor,
+    net:     str = "alex",
+    model:   Optional[object] = None,   # istanza LPIPS pre-caricata
+) -> float:
+    """
+    LPIPS (Learned Perceptual Image Patch Similarity).
+
+    Misura la distanza percettiva — più basso è meglio.
+    Target: < 0.08.
+
+    Parameters
+    ----------
+    pred, tgt : (B,3,H,W) float32 [0,1]
+    net       : "alex" | "vgg" | "squeeze"
+    model     : istanza lpips.LPIPS pre-caricata (per non ricaricarla ogni volta)
+    """
+    try:
+        import lpips
+        if model is None:
+            model = lpips.LPIPS(net=net).to(pred.device)
+            model.eval()
+
+        # LPIPS si aspetta input in [-1, 1]
+        pred_n = pred * 2.0 - 1.0
+        tgt_n  = tgt  * 2.0 - 1.0
+        dist   = model(pred_n, tgt_n)
+        return dist.mean().item()
+
+    except ImportError:
+        # Fallback: MSE nello spazio RGB come proxy
+        return F.mse_loss(pred, tgt).item()
+
+
+# ---------------------------------------------------------------------------
+# NIMA Δ score
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_nima_delta(
     pred: torch.Tensor,
-    target: torch.Tensor,
-    src: Optional[torch.Tensor] = None,
-    lpips_metric: Optional[LPIPSMetric] = None,
-    nima_metric:  Optional[NIMAMetric]  = None,
-) -> Dict[str, torch.Tensor]:
+    src:  torch.Tensor,
+    model: Optional[object] = None,
+) -> float:
     """
-    Calcola tutte le metriche su un singolo batch.
+    Δ punteggio estetico NIMA: quanto migliora l'estetica rispetto alla sorgente.
 
-    Args:
-        pred:   (B, 3, H, W) in [0,1].
-        target: (B, 3, H, W) in [0,1].
-        src:    (B, 3, H, W) in [0,1] — necessario per Δ_NIMA.
+    NIMA (Neural Image Assessment) predice una distribuzione di punteggi
+    estetici [1–10] — si calcola il punteggio medio atteso.
 
-    Returns:
-        Dizionario con tensori per elemento del batch.
+    Δ_NIMA = E[score(pred)] - E[score(src)]
+    Target: > 0.5 punti.
+
+    Richiede il modello NIMA (MobileNet fine-tuned su AVA dataset).
+    Se non disponibile, restituisce 0.0.
     """
-    device = pred.device
+    try:
+        nima = _get_nima_model(model, pred.device)
+        if nima is None:
+            return 0.0
 
-    # ΔE₀₀
-    pred_lab   = rgb_to_lab(pred.permute(0, 2, 3, 1))
-    target_lab = rgb_to_lab(target.permute(0, 2, 3, 1))
-    de = ciede2000(pred_lab, target_lab).mean(dim=[1, 2])  # (B,)
+        score_pred = _nima_score(nima, pred)
+        score_src  = _nima_score(nima, src)
+        return score_pred - score_src
 
-    # SSIM su L*
-    ssim = compute_ssim_lstar(pred, target)   # (B,)
+    except Exception:
+        return 0.0
 
-    results = {
-        "delta_e": de,
-        "ssim":    ssim,
-    }
 
-    # LPIPS
-    if lpips_metric is not None:
-        lp = lpips_metric(pred, target)
-        results["lpips"] = lp.to(device)
+def _get_nima_model(model, device):
+    """Carica il modello NIMA se non già caricato."""
+    if model is not None:
+        return model
+    try:
+        nima = torch.hub.load(
+            "YijunMaverick/NIMA", "nima",
+            pretrained=True, verbose=False,
+        ).to(device).eval()
+        return nima
+    except Exception:
+        return None
 
-    # Δ NIMA
-    if nima_metric is not None and src is not None:
-        dn = nima_metric.delta_score(pred, src)
-        results["delta_nima"] = dn.to(device)
+
+def _nima_score(model, img: torch.Tensor) -> float:
+    """Calcola il punteggio NIMA medio su un batch."""
+    # NIMA si aspetta (B,3,224,224) normalizzato con ImageNet stats
+    img_resized = F.interpolate(img, size=(224, 224), mode="bilinear",
+                                align_corners=False, antialias=True)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1,3,1,1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1,3,1,1)
+    img_norm = (img_resized - mean) / std
+
+    out = model(img_norm)                       # (B, 10) distribuzione di score
+    scores = torch.arange(1, 11, dtype=torch.float32, device=img.device)
+    return (out * scores).sum(dim=-1).mean().item()
+
+
+# ---------------------------------------------------------------------------
+# compute_all
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_all(
+    pred:         torch.Tensor,
+    tgt:          torch.Tensor,
+    src:          Optional[torch.Tensor] = None,
+    lpips_model:  Optional[object] = None,
+    nima_model:   Optional[object] = None,
+    compute_nima: bool = False,
+) -> Dict[str, float]:
+    """
+    Calcola tutte le metriche in un colpo solo.
+
+    Parameters
+    ----------
+    pred, tgt     : (B,3,H,W) sRGB [0,1]
+    src           : immagine sorgente (per NIMA Δ)
+    lpips_model   : istanza lpips.LPIPS pre-caricata
+    nima_model    : istanza NIMA pre-caricata
+    compute_nima  : se False salta NIMA (lento)
+
+    Returns
+    -------
+    dict con: delta_e, ssim_L, lpips, nima_delta (opzionale)
+    """
+    results: Dict[str, float] = {}
+
+    results["delta_e"] = compute_delta_e(pred, tgt)
+    results["ssim_L"]  = compute_ssim_L(pred, tgt)
+    results["lpips"]   = compute_lpips(pred, tgt, model=lpips_model)
+
+    if compute_nima and src is not None:
+        results["nima_delta"] = compute_nima_delta(pred, src, model=nima_model)
 
     return results
-
-
-@torch.no_grad()
-def evaluate_dataset(
-    model: nn.Module,
-    loader: DataLoader,
-    device: str = "cuda",
-    compute_lpips: bool = True,
-    compute_nima: bool = False,
-) -> MetricsResult:
-    """
-    Valuta il modello su un intero dataset.
-
-    Args:
-        model:         Modello HybridStyleNet in eval mode.
-        loader:        DataLoader con sample {src, tgt}.
-        device:        Device.
-        compute_lpips: Se True, calcola LPIPS.
-        compute_nima:  Se True, calcola Δ NIMA.
-
-    Returns:
-        MetricsResult aggregato.
-    """
-    dev = torch.device(device)
-    model.eval()
-    model.to(dev)
-
-    lpips_metric = LPIPSMetric(device=device) if compute_lpips else None
-    nima_metric  = NIMAMetric(device=device)  if compute_nima  else None
-
-    total: Dict[str, float] = {
-        "delta_e": 0.0, "ssim": 0.0,
-        "lpips": 0.0, "delta_nima": 0.0,
-    }
-    n_samples = 0
-
-    for batch in loader:
-        src = batch["src"].to(dev)
-        tgt = batch["tgt"].to(dev)
-        B   = src.shape[0]
-
-        out  = model(src)
-        pred = out["pred"]
-
-        batch_metrics = evaluate_batch(
-            pred, tgt, src=src,
-            lpips_metric=lpips_metric,
-            nima_metric=nima_metric,
-        )
-
-        for k, v in batch_metrics.items():
-            total[k] = total.get(k, 0.0) + v.sum().item()
-
-        n_samples += B
-
-    n = max(n_samples, 1)
-    result = MetricsResult(
-        delta_e    = total["delta_e"]    / n,
-        ssim       = total["ssim"]       / n,
-        lpips      = total.get("lpips", 0.0)      / n,
-        delta_nima = total.get("delta_nima", 0.0) / n,
-        n_samples  = n_samples,
-    )
-
-    logger.info(f"Evaluation: {result}")
-    return result

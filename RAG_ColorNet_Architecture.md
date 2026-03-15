@@ -33,8 +33,8 @@
 
 Uno stile fotografico professionale non è una trasformazione continua arbitraria. È un insieme finito di **modalità stilistiche** — internamente chiamate cluster — ognuna delle quali corrisponde a un contesto fotografico specifico (golden hour, interno, overcast, ecc.). Quando un fotografo grada una foto, esegue implicitamente due operazioni:
 
-1. **Assegnazione modale**: riconosce il contesto cromatico globale della scena e seleziona il cluster di stile appropriato
-2. **Trasferimento locale**: all'interno del cluster, applica il trattamento cromatico che ha usato su foto simili in passato — non una media, ma una combinazione pesata degli esempi più pertinenti per ogni zona dell'immagine
+1. **Assegnazione modale**: riconosce il contesto cromatico globale della scena e seleziona il preset (cluster) di stile appropriato
+2. **Trasferimento locale**: una volta applicato il preset, applica il trattamento cromatico che ha usato su foto simili in passato — non una media, ma una combinazione pesata degli esempi più pertinenti per ogni zona dell'immagine.
 
 Questo processo è esattamente quello che RAG-ColorNet modella esplicitamente.
 

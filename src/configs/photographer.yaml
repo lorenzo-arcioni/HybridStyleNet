@@ -1,0 +1,92 @@
+# ============================================================
+# RAG-ColorNet — Photographer Adaptation Config
+# Overrides base.yaml for few-shot adaptation (Phase 3).
+# Usage: pass both base.yaml and this file; values here win.
+# ============================================================
+
+# ------------------------------------------------------------
+# Photographer identity
+# ------------------------------------------------------------
+photographer:
+  id:               "photographer_01"            # unique identifier
+  name:             ""                           # optional display name
+  style_period:     ""                           # e.g. "2022-2024" for consistency check
+
+# ------------------------------------------------------------
+# Dataset — few-shot pairs
+# ------------------------------------------------------------
+data:
+  pairs_dir:        "data/photographers/photographer_01/"
+  src_subdir:       "src"                        # RAW or sRGB source images
+  tgt_subdir:       "tgt"                        # photographer-edited JPEGs/TIFFs
+  image_extensions: [".jpg", ".jpeg", ".tif", ".tiff", ".arw", ".dng"]
+  val_split:        0.20                         # fraction held out for early stopping
+  val_split_seed:   42
+
+  # Target resolution during adaptation training
+  train_resolution: [512, 384]                   # H x W (resized for training)
+  keep_aspect:      true                         # pad instead of stretch
+
+# ------------------------------------------------------------
+# Cluster initialization
+# ------------------------------------------------------------
+cluster:
+  # Overrides base.yaml defaults — tune per photographer
+  k_max:            12                           # fewer clusters for small N
+  elbow_tau:        0.1
+
+# ------------------------------------------------------------
+# Phase 3 — few-shot adaptation training
+# ------------------------------------------------------------
+adaptation:
+  n_epochs_total:   30
+
+  # Step 1: partial adaptation (frozen backbone layers)
+  step1_epochs:     10                           # epochs 1–10
+  lr_step1:         5.0e-5
+  frozen_modules:                                # frozen during step 1
+    - "scene_encoder"                            # DINOv2 always frozen
+    - "bilateral_grid.global_branch.early_layers"
+
+  # Step 2: full fine-tuning
+  step2_epochs:     20                           # epochs 11–30
+  lr_step2:         2.5e-5
+  cosine_annealing: true
+
+  # Curriculum breakpoints (epoch indices, 1-based)
+  curriculum_early_end:  5                       # switch early→mid at epoch 6
+  curriculum_mid_end:    10                      # switch mid→late at epoch 11
+
+  batch_size:       4
+  grad_clip_norm:   1.0
+
+# ------------------------------------------------------------
+# Early stopping
+# ------------------------------------------------------------
+early_stopping:
+  enabled:          true
+  monitor:          "val_delta_e"
+  patience:         5
+  min_delta:        0.01
+  mode:             "min"
+
+# ------------------------------------------------------------
+# Incremental update (post-adaptation)
+# ------------------------------------------------------------
+incremental:
+  enabled:          true
+  recluster_every:  50                           # new pairs before re-cluster check
+  recluster_finetune_epochs: 5                   # ClusterNet-only fine-tune after re-cluster
+  recluster_lr:     1.0e-4
+
+# ------------------------------------------------------------
+# Checkpoint to start from (meta-learned init)
+# ------------------------------------------------------------
+init_checkpoint:    "checkpoints/meta_best.pth"  # θ_meta from phase 2
+
+# ------------------------------------------------------------
+# Output
+# ------------------------------------------------------------
+output:
+  photographer_db_path: "memory/photographer_01/"
+  adapted_checkpoint:   "checkpoints/photographer_01_adapted.pth"

@@ -1,0 +1,106 @@
+# ============================================================
+# RAG-ColorNet — Meta-Training Config (Phase 2 — Reptile)
+# Overrides base.yaml. Produces θ_meta: an initialization
+# that adapts rapidly to any photographer in few-shot regime.
+# ============================================================
+
+# ------------------------------------------------------------
+# Task definition
+# ------------------------------------------------------------
+tasks:
+  # Real tasks: per-photographer splits from pre-training datasets
+  real:
+    fivek_photographers:  5                      # retouchers A–E
+    ppr10k_photographers: 3
+    support_size:         15                     # |D_sup| per task
+    query_size:           5                      # |D_qry| per task
+
+  # Synthetic tasks: style interpolation between real photographers
+  synthetic:
+    enabled:              true
+    n_lambda_values:      10                     # interpolation steps ∈ (0,1)
+    # n_synthetic = C(n_real, 2) × n_lambda = 28 × 10 = 280 tasks
+
+  # Cross-photographer retrieval augmentation
+  cross_photographer:
+    enabled:              true
+    # use DB of photographer i to grade photos of photographer j
+    # teaches MaskNet to detect unreliable retrieval
+
+  total_tasks_per_epoch:  64                     # tasks sampled per epoch (real + synthetic)
+
+# ------------------------------------------------------------
+# Reptile algorithm
+# ------------------------------------------------------------
+reptile:
+  # Inner loop
+  n_inner_steps:    5                            # gradient steps per task
+  inner_lr:         1.0e-3                       # α — inner loop learning rate
+  inner_optimizer:  "sgd"                        # SGD for inner loop (standard in Reptile)
+
+  # Outer loop
+  n_tasks_per_batch: 2                           # M tasks averaged per meta-update
+  outer_lr:         1.0e-2                       # ε — outer loop step size
+  outer_optimizer:  "adam"                       # Adam for outer loop
+
+  # Meta-update rule:
+  # θ ← θ + (ε / M) * Σ_m (θ̃_m - θ)
+
+# ------------------------------------------------------------
+# Trainable modules during meta-training
+# (ClusterNet is excluded — re-initialized fresh per photographer)
+# ------------------------------------------------------------
+trainable_modules:
+  - "retrieval_module"                           # W_Q, W_K, W_V
+  - "bilateral_grid"                             # GridNet
+  - "confidence_mask"                            # MaskNet
+  - "bilateral_grid.guide_mlp"                   # semantic guide
+
+frozen_modules:
+  - "scene_encoder"                              # DINOv2 — always frozen
+  - "cluster_net"                                # not meta-learned
+
+# ------------------------------------------------------------
+# Training loop
+# ------------------------------------------------------------
+training:
+  n_iterations:     10000                        # total Reptile outer steps
+  batch_size:       1                            # per task (inner loop)
+  grad_clip_norm:   1.0                          # clip inner loop gradients
+  fp16:             true
+
+# ------------------------------------------------------------
+# Loss — same simplified loss as pre-training
+# ------------------------------------------------------------
+loss_mode:          "pretrain"                   # uses base.yaml loss.pretrain weights
+
+# ------------------------------------------------------------
+# Task augmentation details
+# ------------------------------------------------------------
+augmentation:
+  style_interpolation:
+    # I_tgt_λ = Lab^{-1}(λ * Lab(I_tgt_i) + (1-λ) * Lab(I_tgt_j))
+    lambda_range:   [0.1, 0.9]
+    space:          "lab"                        # interpolation in CIE Lab
+
+  cluster_perturbation:
+    enabled:        true
+    swap_fraction:  0.1                          # fraction of pairs swapped between clusters
+
+# ------------------------------------------------------------
+# Initialization
+# ------------------------------------------------------------
+init_checkpoint:    "checkpoints/pretrain_best.pth"   # warm-start from phase 1
+
+# ------------------------------------------------------------
+# Checkpointing & logging
+# ------------------------------------------------------------
+checkpointing:
+  output_path:          "checkpoints/meta_best.pth"
+  save_every_n_iters:   1000
+  keep_last_n:          3
+
+logging:
+  run_name:             "meta_training_reptile"
+  log_every_n_steps:    50
+  log_inner_loss:       true                     # log per-task inner loss for debugging

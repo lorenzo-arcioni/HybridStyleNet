@@ -1,246 +1,205 @@
 """
-utils/logging_utils.py
+logging_utils.py
+----------------
+Logger unificato per tensorboard e/o wandb.
 
-Logger strutturato e wrapper TensorBoard.
+Espone una classe Logger con API identica indipendentemente dal backend,
+così i notebook non dipendono direttamente da tensorboard o wandb.
+
+Uso tipico in un notebook:
+    logger = Logger.from_config(cfg, run_name="adapt_ph01")
+    logger.log_scalars(metrics, step=epoch)
+    logger.log_images({"pred": img_tensor}, step=epoch)
+    logger.close()
 """
 
-import logging
-import sys
+from __future__ import annotations
+
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Dict, Optional, Union
 
 import torch
 
 
-# ── Logger Python standard ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
 
-def get_logger(
-    name: str,
-    log_dir: Optional[str] = None,
-    level: int = logging.INFO,
-    console: bool = True,
-) -> logging.Logger:
+class Logger:
     """
-    Crea (o recupera) un logger con handler su console e, opzionalmente, su file.
+    Logger unificato tensorboard / wandb / console.
 
-    Args:
-        name:    Nome del logger (tipicamente __name__ del modulo chiamante).
-        log_dir: Directory per il file di log. Se None, nessun file handler.
-        level:   Livello di logging (default: INFO).
-        console: Se True, aggiunge un handler su stdout.
-
-    Returns:
-        Logger configurato.
-    """
-    logger = logging.getLogger(name)
-
-    # Evita di aggiungere handler duplicati se il logger esiste già
-    if logger.handlers:
-        return logger
-
-    logger.setLevel(level)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    if console:
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(level)
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
-
-    if log_dir is not None:
-        log_path = Path(log_dir)
-        log_path.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_path / f"{name}.log", encoding="utf-8")
-        fh.setLevel(level)
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
-
-    # Evita propagazione al root logger per non duplicare i messaggi
-    logger.propagate = False
-
-    return logger
-
-
-# ── Wrapper TensorBoard ──────────────────────────────────────────────────────
-
-class TensorBoardLogger:
-    """
-    Wrapper leggero attorno a SummaryWriter di TensorBoard.
-
-    Gestisce la creazione lazy dello scrittore e fornisce metodi
-    di convenienza per le metriche tipiche del training.
+    Parameters
+    ----------
+    log_dir     : directory per i log tensorboard
+    backend     : "tensorboard" | "wandb" | "both" | "none"
+    run_name    : nome della run (usato da wandb)
+    project     : nome del progetto wandb
+    config      : dict di iperparametri da loggare (wandb)
     """
 
     def __init__(
         self,
-        log_dir: str,
-        enabled: bool = True,
-        comment: str = "",
+        log_dir:  Union[str, Path] = "logs/",
+        backend:  str  = "tensorboard",
+        run_name: str  = "run",
+        project:  str  = "rag-colornet",
+        config:   Optional[dict] = None,
     ) -> None:
-        """
-        Args:
-            log_dir:  Directory per i file di evento TensorBoard.
-            enabled:  Se False, tutti i metodi sono no-op (disabilita senza
-                      modificare il codice chiamante).
-            comment:  Suffisso opzionale aggiunto alla directory.
-        """
-        self.enabled = enabled
-        self._writer = None
+        self.log_dir  = Path(log_dir)
+        self.backend  = backend
+        self.run_name = run_name
+        self._tb      = None
+        self._wandb   = None
+        self._step    = 0
 
-        if enabled:
-            try:
-                from torch.utils.tensorboard import SummaryWriter
-                self._writer = SummaryWriter(log_dir=log_dir, comment=comment)
-                self._logger = get_logger("tensorboard")
-                self._logger.info(f"TensorBoard log dir: {log_dir}")
-            except ImportError:
-                self.enabled = False
-                logging.getLogger(__name__).warning(
-                    "tensorboard non installato. Logging disabilitato."
-                )
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Scalari ──────────────────────────────────────────────────────────────
+        if backend in ("tensorboard", "both"):
+            self._init_tensorboard(run_name)
 
-    def log_scalar(self, tag: str, value: float, step: int) -> None:
-        """Registra un singolo scalare."""
-        if self.enabled and self._writer is not None:
-            self._writer.add_scalar(tag, value, global_step=step)
+        if backend in ("wandb", "both"):
+            self._init_wandb(run_name, project, config)
 
+    # ------------------------------------------------------------------
+    def _init_tensorboard(self, run_name: str) -> None:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir    = self.log_dir / run_name
+            self._tb  = SummaryWriter(log_dir=str(tb_dir))
+        except ImportError:
+            print("tensorboard non disponibile — log tensorboard disabilitato.")
+
+    def _init_wandb(self, run_name: str, project: str, config: Optional[dict]) -> None:
+        try:
+            import wandb
+            self._wandb = wandb.init(
+                project = project,
+                name    = run_name,
+                config  = config or {},
+                reinit  = True,
+            )
+        except ImportError:
+            print("wandb non disponibile — log wandb disabilitato.")
+
+    # ------------------------------------------------------------------
     def log_scalars(
-        self, main_tag: str, tag_scalar_dict: Dict[str, float], step: int
+        self,
+        metrics: Dict[str, float],
+        step:    Optional[int] = None,
     ) -> None:
-        """Registra un dizionario di scalari sotto un unico tag."""
-        if self.enabled and self._writer is not None:
-            self._writer.add_scalars(main_tag, tag_scalar_dict, global_step=step)
-
-    def log_metrics(self, metrics: Dict[str, float], step: int, prefix: str = "") -> None:
         """
-        Registra un dizionario di metriche, opzionalmente con prefisso.
+        Logga un dizionario di scalari.
 
-        Args:
-            metrics: Es. {"delta_e": 3.2, "ssim": 0.97}.
-            step:    Step globale.
-            prefix:  Es. "train/" o "val/".
+        Parameters
+        ----------
+        metrics : {"loss/total": 0.42, "loss/delta_e": 1.2, ...}
+        step    : step globale; se None usa il contatore interno
         """
-        for k, v in metrics.items():
-            tag = f"{prefix}{k}" if prefix else k
-            self.log_scalar(tag, v, step)
+        s = step if step is not None else self._step
 
-    # ── Istogrammi ───────────────────────────────────────────────────────────
+        if self._tb is not None:
+            for k, v in metrics.items():
+                self._tb.add_scalar(k, v, global_step=s)
 
-    def log_histogram(
-        self, tag: str, values: torch.Tensor, step: int
-    ) -> None:
-        """Registra la distribuzione di un tensore come istogramma."""
-        if self.enabled and self._writer is not None:
-            self._writer.add_histogram(tag, values, global_step=step)
+        if self._wandb is not None:
+            self._wandb.log({**metrics, "step": s})
 
-    # ── Immagini ─────────────────────────────────────────────────────────────
+        self._step = s + 1
 
+    # ------------------------------------------------------------------
     def log_images(
         self,
-        tag: str,
-        images: torch.Tensor,
-        step: int,
-        max_images: int = 4,
-        dataformats: str = "NCHW",
+        images:   Dict[str, torch.Tensor],
+        step:     Optional[int] = None,
+        max_imgs: int = 4,
     ) -> None:
         """
-        Registra una griglia di immagini.
+        Logga immagini.
 
-        Args:
-            tag:        Tag TensorBoard.
-            images:     Tensore shape (N, C, H, W) in [0, 1].
-            step:       Step globale.
-            max_images: Massimo numero di immagini da loggare.
-            dataformats: Formato dimensioni (default NCHW).
+        Parameters
+        ----------
+        images  : {"pred": (B,3,H,W), "tgt": (B,3,H,W), ...}
+        step    : step globale
+        max_imgs: max immagini del batch
         """
-        if self.enabled and self._writer is not None:
-            imgs = images[:max_images].clamp(0.0, 1.0).float()
-            self._writer.add_images(tag, imgs, global_step=step,
-                                    dataformats=dataformats)
+        s = step if step is not None else self._step
 
-    def log_comparison(
+        if self._tb is not None:
+            for tag, img in images.items():
+                if img.dim() == 3:
+                    img = img.unsqueeze(0)
+                self._tb.add_images(tag, img[:max_imgs].clamp(0, 1), global_step=s)
+
+        if self._wandb is not None:
+            import wandb
+            wandb_imgs = {}
+            for tag, img in images.items():
+                if img.dim() == 3:
+                    img = img.unsqueeze(0)
+                imgs = img[:max_imgs].clamp(0, 1)
+                wandb_imgs[tag] = [
+                    wandb.Image(imgs[i].permute(1, 2, 0).cpu().numpy())
+                    for i in range(imgs.shape[0])
+                ]
+            self._wandb.log({**wandb_imgs, "step": s})
+
+    # ------------------------------------------------------------------
+    def log_histogram(
         self,
-        src: torch.Tensor,
-        pred: torch.Tensor,
-        tgt: torch.Tensor,
-        step: int,
-        max_images: int = 4,
+        tag:    str,
+        values: torch.Tensor,
+        step:   Optional[int] = None,
     ) -> None:
-        """
-        Logga una tripla (sorgente, predizione, target) affiancata.
+        """Logga un istogramma di valori (solo tensorboard)."""
+        s = step if step is not None else self._step
+        if self._tb is not None:
+            self._tb.add_histogram(tag, values.detach().cpu(), global_step=s)
 
-        Args:
-            src:  Immagini sorgente  (N, 3, H, W) in [0,1].
-            pred: Immagini predette  (N, 3, H, W) in [0,1].
-            tgt:  Immagini target    (N, 3, H, W) in [0,1].
-            step: Step globale.
-        """
-        if not (self.enabled and self._writer is not None):
-            return
+    # ------------------------------------------------------------------
+    def log_text(self, tag: str, text: str, step: Optional[int] = None) -> None:
+        """Logga testo libero."""
+        s = step if step is not None else self._step
+        if self._tb is not None:
+            self._tb.add_text(tag, text, global_step=s)
+        if self._wandb is not None:
+            self._wandb.log({tag: text, "step": s})
 
-        n = min(max_images, src.shape[0])
-        # Concatena orizzontalmente: [src | pred | tgt]
-        row = torch.cat([src[:n], pred[:n], tgt[:n]], dim=3)  # (n, 3, H, 3W)
-        self.log_images("comparison/src_pred_tgt", row, step,
-                        max_images=n, dataformats="NCHW")
-
-    # ── Learning rate ────────────────────────────────────────────────────────
-
-    def log_lr(
+    # ------------------------------------------------------------------
+    def print_metrics(
         self,
-        optimizer: torch.optim.Optimizer,
-        step: int,
-        prefix: str = "train/",
+        metrics: Dict[str, float],
+        prefix:  str = "",
+        epoch:   Optional[int] = None,
     ) -> None:
-        """Logga il learning rate corrente di tutti i param group."""
-        if self.enabled and self._writer is not None:
-            for i, pg in enumerate(optimizer.param_groups):
-                self._writer.add_scalar(
-                    f"{prefix}lr_group{i}", pg["lr"], global_step=step
-                )
+        """Stampa le metriche su stdout in formato leggibile."""
+        ep_str = f"[ep {epoch:3d}] " if epoch is not None else ""
+        parts  = [f"{k.split('/')[-1]}: {v:.4f}" for k, v in metrics.items()
+                  if isinstance(v, (int, float))]
+        print(f"{ep_str}{prefix}{' | '.join(parts)}")
 
-    # ── Loss breakdown ───────────────────────────────────────────────────────
-
-    def log_loss_breakdown(
-        self,
-        loss_dict: Dict[str, Union[float, torch.Tensor]],
-        step: int,
-        prefix: str = "train/",
-    ) -> None:
-        """
-        Logga ogni componente della loss composita separatamente.
-
-        Args:
-            loss_dict: Es. {"delta_e": 2.1, "hist": 0.5, "perc": 0.3, ...}.
-            step:      Step globale.
-            prefix:    Prefisso tag TensorBoard.
-        """
-        if not (self.enabled and self._writer is not None):
-            return
-
-        for k, v in loss_dict.items():
-            val = v.item() if isinstance(v, torch.Tensor) else float(v)
-            self._writer.add_scalar(f"{prefix}loss/{k}", val, global_step=step)
-
-    # ── Lifecycle ────────────────────────────────────────────────────────────
-
-    def flush(self) -> None:
-        """Forza scrittura buffer su disco."""
-        if self.enabled and self._writer is not None:
-            self._writer.flush()
-
+    # ------------------------------------------------------------------
     def close(self) -> None:
-        """Chiude lo scrittore TensorBoard."""
-        if self.enabled and self._writer is not None:
-            self._writer.close()
+        """Chiude i writer."""
+        if self._tb is not None:
+            self._tb.close()
+        if self._wandb is not None:
+            self._wandb.finish()
 
-    def __enter__(self) -> "TensorBoardLogger":
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        self.close()
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_config(
+        cls,
+        cfg:      dict,
+        run_name: str,
+        config:   Optional[dict] = None,
+    ) -> "Logger":
+        lcfg = cfg.get("logging", {})
+        return cls(
+            log_dir  = cfg["paths"]["logs_dir"],
+            backend  = lcfg.get("backend", "tensorboard"),
+            run_name = run_name,
+            project  = "rag-colornet",
+            config   = config,
+        )

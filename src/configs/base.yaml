@@ -1,0 +1,192 @@
+# ============================================================
+# RAG-ColorNet — Base Configuration
+# All other configs inherit from / override this file.
+# ============================================================
+
+# ------------------------------------------------------------
+# Project paths
+# ------------------------------------------------------------
+paths:
+  data_root:        "data/"                      # root for all datasets
+  checkpoints_dir:  "checkpoints/"               # saved model weights
+  logs_dir:         "logs/"                      # tensorboard / wandb logs
+  output_dir:       "outputs/"                   # inference results
+  cache_dir:        "cache/"                     # pre-computed DINOv2 features
+
+# ------------------------------------------------------------
+# Hardware & precision
+# ------------------------------------------------------------
+hardware:
+  device:           "cuda"                       # "cuda" | "cpu"
+  fp16:             true                         # mixed-precision training
+  compile:          false                        # torch.compile (requires PyTorch 2.x)
+  num_workers:      4                            # DataLoader workers
+  pin_memory:       true
+
+# ------------------------------------------------------------
+# Scene encoder — DINOv2
+# ------------------------------------------------------------
+encoder:
+  backbone:         "dinov2_vits14"              # Small, 21M params
+  patch_size:       14
+  embed_dim:        384
+  frozen:           true                         # NEVER updated
+  imagenet_mean:    [0.485, 0.456, 0.406]
+  imagenet_std:     [0.229, 0.224, 0.225]
+
+# Color histogram (CIE Lab)
+histogram:
+  n_bins:           64                           # bins per channel → 192-dim total
+  sigma_scale:      0.5                          # sigma_bin = delta_mu * sigma_scale
+
+# Patch descriptor (semantic + chromatic fusion)
+descriptor:
+  chroma_dim:       32                           # projected chromatic feature dim
+  output_dim:       416                          # 384 (DINOv2) + 32 (chroma)
+
+# ------------------------------------------------------------
+# Cluster assignment — ClusterNet
+# ------------------------------------------------------------
+cluster:
+  k_max:            15                           # upper bound on number of clusters
+  k_min:            1
+  hidden_dim:       256                          # MLP hidden size
+  elbow_tau:        0.1                          # elbow criterion threshold
+  recluster_every:  50                           # new pairs before optional re-cluster
+  assignment_loss_epochs: 5                      # epochs with L_cluster active
+
+# ------------------------------------------------------------
+# Retrieval module
+# ------------------------------------------------------------
+retrieval:
+  d_r:              256                          # projection dim for Q, K, V
+  top_m:            10                           # top-M images retrieved per cluster
+  faiss_nlist:      16                           # IVF number of Voronoi cells
+  faiss_nprobe:     4                            # cells to visit at query time
+  faiss_pq_m:       8                            # PQ sub-quantizers
+  skip_threshold:   0.01                         # skip cluster if p_k < threshold
+
+# ------------------------------------------------------------
+# Bilateral grid renderer — GridNet
+# ------------------------------------------------------------
+bilateral_grid:
+  # Global grid
+  global_s:         8                            # spatial resolution (8x8)
+  global_l:         8                            # luminance bins
+  # Local grid
+  local_s:          16                           # spatial resolution (16x16)
+  local_l:          8                            # luminance bins
+  # Affine output: 3x4 per bin = 12 coefficients
+  n_affine_coeffs:  12
+  # Semantic guide MLP
+  guide_hidden:     64
+  guide_alpha:      0.5                          # weight of chroma vs semantic guide
+  # GridNet fusion
+  fusion_dim:       256
+  dino_proj_dim:    128                          # DINOv2 384 → 128 projection
+
+# ------------------------------------------------------------
+# Confidence mask — MaskNet
+# ------------------------------------------------------------
+mask:
+  upsample_dim:     128                          # projected DINOv2 for mask input
+  hidden_channels:  64
+  upsample_factor:  4                            # mask computed at H/4 x W/4
+
+# ------------------------------------------------------------
+# Loss function — weights by training phase
+# ------------------------------------------------------------
+# Curriculum:
+#   phase 1 (pretrain)     → simplified loss
+#   phase 2 (meta)         → same as pretrain
+#   phase 3 epochs 1-5     → L1Lab dominant + cluster + retrieval
+#   phase 3 epochs 6-10    → transition to ΔE + perceptual
+#   phase 3 epochs 11+     → stable regime
+
+loss:
+  epsilon: 1.0e-7                                # numerical stability
+
+  # --- phase 3 curriculum stages ---
+  curriculum:
+    early:                                       # epochs 1–5
+      delta_e:      0.0
+      l1_lab:       0.8
+      histogram:    0.4
+      perceptual:   0.0
+      chroma:       0.0
+      cluster:      0.3
+      retrieval:    0.5
+      tv:           0.01
+      luminance:    0.3
+      entropy:      0.01
+
+    mid:                                         # epochs 6–10
+      delta_e:      0.3
+      l1_lab:       0.4
+      histogram:    0.3
+      perceptual:   0.3
+      chroma:       0.1
+      cluster:      0.0
+      retrieval:    0.3
+      tv:           0.01
+      luminance:    0.3
+      entropy:      0.01
+
+    late:                                        # epochs 11+
+      delta_e:      0.5
+      l1_lab:       0.0
+      histogram:    0.3
+      perceptual:   0.6
+      chroma:       0.2
+      cluster:      0.0
+      retrieval:    0.2
+      tv:           0.01
+      luminance:    0.3
+      entropy:      0.01
+
+  # --- pretrain / meta simplified loss ---
+  pretrain:
+    delta_e:        1.0
+    perceptual:     0.5
+    retrieval:      0.3
+
+  # --- chroma sub-loss mixing ---
+  chroma_hue_weight: 0.5                         # L_chroma = L_sat + 0.5 * L_hue
+
+# ------------------------------------------------------------
+# Training — shared optimizer settings
+# ------------------------------------------------------------
+optimizer:
+  type:             "adamw"
+  betas:            [0.9, 0.999]
+  eps:              1.0e-8
+  weight_decay:     2.0e-3
+
+scheduler:
+  type:             "cosine"                     # cosine annealing with warmup
+  warmup_epochs:    2
+  eta_min:          1.0e-7
+
+# ------------------------------------------------------------
+# Logging & checkpointing
+# ------------------------------------------------------------
+logging:
+  backend:          "tensorboard"                # "tensorboard" | "wandb" | "both"
+  log_every_n_steps: 50
+  save_images_every_n_epochs: 5                  # save sample graded images
+  n_sample_images:  4
+
+checkpointing:
+  save_every_n_epochs: 5
+  keep_last_n:      3
+  save_best_metric: "delta_e"                    # metric to track for best checkpoint
+  best_mode:        "min"
+
+# ------------------------------------------------------------
+# Inference
+# ------------------------------------------------------------
+inference:
+  max_resolution:   [3000, 2000]                 # H x W cap before tiling
+  tile_overlap:     64                           # px overlap for tiled inference
+  output_format:    "tiff"                       # "tiff" | "jpeg" | "png"
+  jpeg_quality:     95

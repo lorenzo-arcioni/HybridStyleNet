@@ -1,486 +1,330 @@
 """
-training/adapt.py
+adapt.py
+--------
+Funzioni per la Fase 3 (few-shot adaptation). Notebook-friendly.
 
-Fase 3: Few-shot adaptation al fotografo target  (§5.4, §8.4).
+Espone la logica dei due step di adaptation in funzioni granulari:
 
-Schema Freeze-Then-Unfreeze:
-    Fase 3A (epoche 1-10):  congela CNN stage 1-2 + Swin stage 4
-    Fase 3B (epoche 11-30): scongela tutto, LR ridotto + cosine annealing
+  setup_adaptation(model, database, faiss_mgr, cfg, device)
+      → prepara il modello per l'adaptation (freeze/unfreeze, preprocessing)
+        restituisce (optimizer_step1, scaler)
 
-Early stopping su val_delta_e con patience=5.
+  adaptation_step1_epoch(model, loader, ...)
+      → un'epoca con freeze parziale (ClusterNet + proiezioni + ultimi layer)
+
+  adaptation_step2_epoch(model, loader, ...)
+      → un'epoca con full fine-tuning
+
+  switch_to_step2(model, optimizer, cfg)
+      → sblocca tutti i parametri trainable, costruisce nuovo optimizer
+
+Flusso tipico in un notebook:
+  opt1, scaler = setup_adaptation(model, db, faiss_mgr, cfg)
+  for epoch in range(1, 11):
+      train_metrics = adaptation_step1_epoch(model, train_loader, opt1, ...)
+      val_metrics   = validate(model, val_loader, ...)
+      if early_stopper.step(val_metrics["loss/total"], model, epoch):
+          ...
+
+  opt2 = switch_to_step2(model, opt1, cfg)
+  for epoch in range(11, 31):
+      train_metrics = adaptation_step2_epoch(model, train_loader, opt2, ...)
+      ...
 """
 
-import logging
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 
-from data.dataset import CustomDataset, collate_paired
-from data.raw_pipeline import RawPipeline
-from data.augmentation import PairAugmentation
-from models.hybrid_style_net import HybridStyleNet
-from losses.composite import ColorAestheticLoss, LossWeights
-from training.scheduler import (
-    CosineAnnealingScheduler,
-    LossCurriculumScheduler,
-    EarlyStopping,
-)
-from utils.checkpoint import (
-    save_checkpoint,
-    load_checkpoint,
-    build_checkpoint_state,
-)
-from utils.logging_utils import get_logger, TensorBoardLogger
-
-logger = get_logger(__name__)
+from losses.composite_loss import CompositeLoss                 # type: ignore[import]
+from memory.database       import PhotographerDatabase          # type: ignore[import]
+from memory.faiss_index    import FAISSIndexManager             # type: ignore[import]
+from memory.incremental_update import IncrementalUpdater        # type: ignore[import]
+from .pretrain             import run_epoch, build_optimizer, build_cluster_db_for_batch
+from .lr_scheduler         import build_scheduler
 
 
-class FewShotAdapter:
+# ---------------------------------------------------------------------------
+# setup_adaptation
+# ---------------------------------------------------------------------------
+
+def setup_adaptation(
+    model:        nn.Module,
+    cfg:          dict,
+    device:       str = "cuda",
+) -> Tuple[torch.optim.Optimizer, GradScaler]:
     """
-    Few-shot adaptation al fotografo target.
+    Prepara il modello per lo Step 1 dell'adaptation:
+      - Carica il checkpoint θ_meta
+      - Imposta i moduli trainable per lo Step 1 (freeze parziale)
+      - Costruisce optimizer e scaler
 
-    Args:
-        model:            HybridStyleNet con pesi theta_meta.
-        custom_root:      Directory con src/ e tgt/ del fotografo.
-        cfg:              Configurazione adapt.yaml.
-        device:           Device di training.
-        checkpoint_dir:   Directory per i checkpoint.
-        log_dir:          Directory TensorBoard.
+    Parameters
+    ----------
+    model   : RAGColorNet (già istanziato con il K* del fotografo)
+    cfg     : config dict completo (base + photographer merged)
+    device  : device
+
+    Returns
+    -------
+    optimizer : AdamW per lo Step 1
+    scaler    : GradScaler fp16
     """
+    # Carica θ_meta
+    init_ckpt = cfg.get("init_checkpoint")
+    if init_ckpt and Path(init_ckpt).exists():
+        ckpt = torch.load(init_ckpt, map_location=device)
+        state = ckpt.get("model_state", ckpt)
+        # Carica solo i parametri compatibili (K potrebbe essere diverso)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  Parametri non trovati nel checkpoint: {len(missing)}")
+        print(f"  Caricato θ_meta da: {init_ckpt}")
+    else:
+        print("  Nessun checkpoint θ_meta trovato — partenza da random init.")
 
-    def __init__(
-        self,
-        model: HybridStyleNet,
-        custom_root: str,
-        cfg: Optional[Dict] = None,
-        device: str = "cuda",
-        checkpoint_dir: str = "checkpoints/adapt",
-        log_dir: str = "logs/adapt",
-    ) -> None:
-        self.model          = model
-        self.custom_root    = custom_root
-        self.cfg            = cfg or {}
-        self.device         = torch.device(device)
-        self.checkpoint_dir = checkpoint_dir
+    model.to(device)
 
-        self.model.to(self.device)
+    # Freeze parziale per Step 1
+    model.set_adaptation_mode(step=1)
 
-        # Config fasi
-        self.phase_a_cfg = self.cfg.get("phase_a", {})
-        self.phase_b_cfg = self.cfg.get("phase_b", {})
-        self.es_cfg      = self.cfg.get("early_stopping", {})
-        self.aug_cfg     = self.cfg.get("augmentation", {})
+    optimizer = build_optimizer(model, cfg, phase="adapt_step1")
+    scaler    = GradScaler(enabled=cfg["hardware"]["fp16"])
 
-        # Loss
-        self.loss_fn = ColorAestheticLoss()
-        self.loss_fn.to(self.device)
+    n_train = model.count_trainable_params()
+    print(f"  Step 1 — parametri trainable: {n_train:,}")
 
-        # AMP
-        self.use_amp = (
-            self.cfg.get("hardware", {}).get("amp", True)
-            and str(self.device) == "cuda"
+    return optimizer, scaler
+
+
+# ---------------------------------------------------------------------------
+# switch_to_step2
+# ---------------------------------------------------------------------------
+
+def switch_to_step2(
+    model:     nn.Module,
+    cfg:       dict,
+    device:    str = "cuda",
+) -> torch.optim.Optimizer:
+    """
+    Sblocca tutti i parametri trainable e costruisce l'optimizer
+    per lo Step 2 (full fine-tuning).
+
+    Da chiamare dopo le epoche dello Step 1.
+
+    Returns
+    -------
+    nuovo AdamW per lo Step 2
+    """
+    model.set_adaptation_mode(step=2)
+    optimizer = build_optimizer(model, cfg, phase="adapt_step2")
+
+    n_train = model.count_trainable_params()
+    print(f"  Step 2 — parametri trainable: {n_train:,}")
+
+    return optimizer
+
+
+# ---------------------------------------------------------------------------
+# adaptation_step1_epoch
+# ---------------------------------------------------------------------------
+
+def adaptation_step1_epoch(
+    model:       nn.Module,
+    loader:      torch.utils.data.DataLoader,
+    optimizer:   torch.optim.Optimizer,
+    loss_fn:     CompositeLoss,
+    scaler:      GradScaler,
+    database:    PhotographerDatabase,
+    faiss_mgr:   FAISSIndexManager,
+    cfg:         dict,
+    epoch:       int,
+    device:      str = "cuda",
+    cluster_labels_map: Optional[Dict[int, int]] = None,
+) -> dict:
+    """
+    Un'epoca di training dello Step 1 dell'adaptation.
+
+    Costruisce il cluster_db per ogni batch usando FAISS,
+    poi delega a run_epoch per la logica di training.
+    """
+    top_m = cfg["retrieval"]["top_m"]
+
+    # Wrapper del loader che inietta il cluster_db nel batch
+    metrics = _run_adaptation_epoch(
+        model      = model,
+        loader     = loader,
+        optimizer  = optimizer,
+        loss_fn    = loss_fn,
+        scaler     = scaler,
+        database   = database,
+        faiss_mgr  = faiss_mgr,
+        top_m      = top_m,
+        phase      = "adapt",
+        epoch      = epoch,
+        device     = device,
+        cluster_labels_map = cluster_labels_map,
+        is_train   = True,
+    )
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# adaptation_step2_epoch
+# ---------------------------------------------------------------------------
+
+def adaptation_step2_epoch(
+    model:       nn.Module,
+    loader:      torch.utils.data.DataLoader,
+    optimizer:   torch.optim.Optimizer,
+    loss_fn:     CompositeLoss,
+    scaler:      GradScaler,
+    database:    PhotographerDatabase,
+    faiss_mgr:   FAISSIndexManager,
+    cfg:         dict,
+    epoch:       int,
+    device:      str = "cuda",
+    cluster_labels_map: Optional[Dict[int, int]] = None,
+) -> dict:
+    """Un'epoca di training dello Step 2 (full fine-tuning)."""
+    top_m = cfg["retrieval"]["top_m"]
+    return _run_adaptation_epoch(
+        model      = model,
+        loader     = loader,
+        optimizer  = optimizer,
+        loss_fn    = loss_fn,
+        scaler     = scaler,
+        database   = database,
+        faiss_mgr  = faiss_mgr,
+        top_m      = top_m,
+        phase      = "adapt",
+        epoch      = epoch,
+        device     = device,
+        cluster_labels_map = cluster_labels_map,
+        is_train   = True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# validate
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def validate(
+    model:     nn.Module,
+    loader:    torch.utils.data.DataLoader,
+    loss_fn:   CompositeLoss,
+    database:  PhotographerDatabase,
+    faiss_mgr: FAISSIndexManager,
+    cfg:       dict,
+    epoch:     int,
+    device:    str = "cuda",
+) -> dict:
+    """Validazione su un loader con il database del fotografo."""
+    top_m = cfg["retrieval"]["top_m"]
+    return _run_adaptation_epoch(
+        model      = model,
+        loader     = loader,
+        optimizer  = None,
+        loss_fn    = loss_fn,
+        scaler     = None,
+        database   = database,
+        faiss_mgr  = faiss_mgr,
+        top_m      = top_m,
+        phase      = "adapt",
+        epoch      = epoch,
+        device     = device,
+        is_train   = False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _run_adaptation_epoch  (implementazione comune)
+# ---------------------------------------------------------------------------
+
+def _run_adaptation_epoch(
+    model:       nn.Module,
+    loader:      torch.utils.data.DataLoader,
+    optimizer:   Optional[torch.optim.Optimizer],
+    loss_fn:     CompositeLoss,
+    scaler:      Optional[GradScaler],
+    database:    PhotographerDatabase,
+    faiss_mgr:   FAISSIndexManager,
+    top_m:       int,
+    phase:       str,
+    epoch:       int,
+    device:      str,
+    cluster_labels_map: Optional[Dict[int, int]] = None,
+    is_train:    bool = True,
+) -> dict:
+    """Logica comune per train e val nell'adaptation."""
+    from .pretrain import train_step, val_step
+
+    weights = loss_fn.update_curriculum(phase, epoch)
+
+    if is_train:
+        model.train()
+        model.scene_encoder.backbone.eval()
+    else:
+        model.eval()
+
+    accum: Dict[str, float] = {}
+    n_batches = 0
+
+    for batch in loader:
+        src = batch["src"].to(device)
+
+        # Costruisce cluster_db per questo batch
+        with torch.no_grad():
+            h = model.scene_encoder.histogram(src)   # (B, 192)
+
+        cluster_db = build_cluster_db_for_batch(
+            query_hist = h,
+            database   = database,
+            faiss_mgr  = faiss_mgr,
+            top_m      = top_m,
+            device     = device,
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        # Logging
-        self.tb = TensorBoardLogger(log_dir)
-
-        self._best_val_delta_e = float("inf")
-        self._best_epoch       = 0
-        self._global_step      = 0
-
-        logger.info(
-            f"FewShotAdapter: custom_root={custom_root}, "
-            f"device={device}, amp={self.use_amp}"
-        )
-
-    # ── Build DataLoaders ─────────────────────────────────────────────────────
-
-    def _build_dataloaders(
-        self,
-        batch_size: int,
-        num_workers: int,
-    ) -> tuple:
-        """
-        Costruisce DataLoader di training e validazione.
-
-        Returns:
-            (train_loader, val_loader)
-        """
-        pipeline = RawPipeline(target_long_side=768)
-
-        aug = PairAugmentation(
-            horizontal_flip_prob=float(
-                self.aug_cfg.get("horizontal_flip_prob", 0.5)
-            ),
-            random_crop_scale=tuple(
-                self.aug_cfg.get("random_crop_scale", [0.7, 1.0])
-            ),
-            rotation_degrees=float(
-                self.aug_cfg.get("rotation_degrees", 5.0)
-            ),
-            exposure_perturb_prob=float(
-                self.aug_cfg.get("exposure_perturb", {}).get("prob", 0.3)
-            ),
-            exposure_range=tuple(
-                self.aug_cfg.get("exposure_perturb", {}).get("range", [0.9, 1.1])
-            ),
-            noise_prob=float(
-                self.aug_cfg.get("noise_perturb", {}).get("prob", 0.3)
-            ),
-            noise_sigma=float(
-                self.aug_cfg.get("noise_perturb", {}).get("sigma", 0.01)
-            ),
-        )
-
-        data_cfg    = self.cfg.get("data", {})
-        val_split   = float(data_cfg.get("val_split", 0.2))
-        max_pairs   = data_cfg.get("max_pairs", None)
-
-        train_ds = CustomDataset(
-            custom_root=self.custom_root,
-            split="train",
-            val_split=val_split,
-            pipeline=pipeline,
-            augmentation=aug,
-            max_pairs=max_pairs,
-        )
-        val_ds = CustomDataset(
-            custom_root=self.custom_root,
-            split="val",
-            val_split=val_split,
-            pipeline=pipeline,
-            augmentation=None,
-        )
-
-        logger.info(
-            f"Dataset: {len(train_ds)} train, {len(val_ds)} val"
-        )
-
-        if len(train_ds) == 0:
-            raise RuntimeError(
-                f"Dataset vuoto in {self.custom_root}. "
-                "Verifica la struttura src/tgt."
-            )
-
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            collate_fn=collate_paired,
-            drop_last=True,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            collate_fn=collate_paired,
-        )
-
-        return train_loader, val_loader
-
-    # ── Calcolo Style Cache ───────────────────────────────────────────────────
-
-    def _build_style_cache(self, train_loader: DataLoader) -> None:
-        """
-        Calcola il style prototype e la cache del training set.
-        """
-        logger.info("Calcolo style cache dal training set...")
-
-        src_list, tgt_list = [], []
-        for batch in train_loader:
-            for i in range(batch["src"].shape[0]):
-                src_list.append(batch["src"][i])
-                tgt_list.append(batch["tgt"][i])
-
-        self.model.set_style_cache(src_list, tgt_list, batch_size=8)
-        logger.info(f"Style cache pronta: {len(src_list)} coppie.")
-
-    # ── Training loop ─────────────────────────────────────────────────────────
-
-    def train(
-        self,
-        resume_from: Optional[str] = None,
-        num_workers: int = 4,
-    ) -> str:
-        """
-        Esegue le fasi 3A e 3B di adaptation.
-
-        Args:
-            resume_from: Checkpoint da cui riprendere.
-            num_workers: Worker DataLoader.
-
-        Returns:
-            Percorso del best checkpoint.
-        """
-        # ── Fase 3A ──────────────────────────────────────────────────────────
-        pa      = self.phase_a_cfg
-        epochs_a  = int(pa.get("epochs",     10))
-        lr_a      = float(pa.get("lr",       5e-5))
-        wd_a      = float(pa.get("weight_decay", 2e-3))
-        bs_a      = int(pa.get("batch_size", 4))
-
-        # Congela i parametri per la fase 3A
-        self.model.freeze_for_adaptation()
-
-        optimizer_a = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=lr_a,
-            weight_decay=wd_a,
-        )
-
-        train_loader, val_loader = self._build_dataloaders(bs_a, num_workers)
-        self._build_style_cache(train_loader)
-
-        curriculum_a = LossCurriculumScheduler(
-            loss_fn=self.loss_fn,
-            verbose=True,
-        )
-
-        early_stop = EarlyStopping(
-            patience=int(self.es_cfg.get("patience", 5)),
-            mode=self.es_cfg.get("mode", "min"),
-        )
-
-        best_ckpt_path = ""
-
-        logger.info(f"=== Fase 3A: epoche 1-{epochs_a} (freeze) ===")
-        for epoch in range(1, epochs_a + 1):
-            curriculum_a.step_epoch(epoch)
-            train_loss = self._train_epoch(
-                train_loader, optimizer_a, epoch
-            )
-            val_metrics = self._validate(val_loader, epoch)
-
-            self._log_epoch(epoch, train_loss, val_metrics,
-                            optimizer_a, prefix="phase_a")
-
-            # Salva best
-            val_de = val_metrics.get("delta_e", float("inf"))
-            is_best = val_de < self._best_val_delta_e
-            if is_best:
-                self._best_val_delta_e = val_de
-                self._best_epoch       = epoch
-
-            state = build_checkpoint_state(
-                self.model, optimizer_a,
-                epoch=epoch,
-                metrics={"val_delta_e": val_de, "train_loss": train_loss},
-            )
-            path = save_checkpoint(
-                state, self.checkpoint_dir,
-                filename=f"epoch_{epoch:04d}.pth",
-                is_best=is_best,
-            )
-            if is_best:
-                best_ckpt_path = str(
-                    Path(self.checkpoint_dir) / "best.pth"
+        # Recupera cluster labels se disponibili
+        cluster_labels = None
+        if cluster_labels_map is not None and weights.cluster > 0:
+            idxs = batch.get("idx")
+            if idxs is not None:
+                cluster_labels = torch.tensor(
+                    [cluster_labels_map.get(int(i), 0) for i in idxs],
+                    dtype=torch.long, device=device,
                 )
 
-            if early_stop.step(val_de, epoch):
-                logger.info("Early stopping nella Fase 3A.")
-                break
-
-        # ── Fase 3B ──────────────────────────────────────────────────────────
-        pb       = self.phase_b_cfg
-        epochs_b = int(pb.get("epochs",     20))
-        lr_b     = float(pb.get("lr",       2.5e-5))
-        wd_b     = float(pb.get("weight_decay", 2e-3))
-        bs_b     = int(pb.get("batch_size", 4))
-        t_max    = int(pb.get("scheduler", {}).get("t_max",  epochs_b))
-        eta_min  = float(pb.get("scheduler", {}).get("eta_min", 1e-6))
-
-        # Scongela tutto
-        self.model.unfreeze_all()
-
-        optimizer_b = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=lr_b,
-            weight_decay=wd_b,
-        )
-        cosine_sched = CosineAnnealingScheduler(
-            optimizer_b, base_lr=lr_b, T_max=t_max, eta_min=eta_min
-        )
-
-        # Ricrea i loader con il nuovo batch size
-        if bs_b != bs_a:
-            train_loader, val_loader = self._build_dataloaders(
-                bs_b, num_workers
+        if is_train and optimizer is not None and scaler is not None:
+            breakdown = train_step(
+                model          = model,
+                batch          = batch,
+                optimizer      = optimizer,
+                loss_fn        = loss_fn,
+                scaler         = scaler,
+                cluster_db     = cluster_db,
+                device         = device,
+                cluster_labels = cluster_labels,
+            )
+        else:
+            breakdown = val_step(
+                model      = model,
+                batch      = batch,
+                loss_fn    = loss_fn,
+                cluster_db = cluster_db,
+                device     = device,
             )
 
-        curriculum_b = LossCurriculumScheduler(loss_fn=self.loss_fn)
-        early_stop_b = EarlyStopping(
-            patience=int(self.es_cfg.get("patience", 5)),
-            mode=self.es_cfg.get("mode", "min"),
-        )
+        for k, v in breakdown.as_loggable().items():
+            accum[k] = accum.get(k, 0.0) + v
+        n_batches += 1
 
-        total_epochs = epochs_a + epochs_b
-        logger.info(
-            f"=== Fase 3B: epoche {epochs_a+1}-{total_epochs} (unfreeze) ==="
-        )
-
-        for local_epoch in range(1, epochs_b + 1):
-            global_epoch = epochs_a + local_epoch
-            curriculum_b.step_epoch(global_epoch)
-
-            train_loss = self._train_epoch(
-                train_loader, optimizer_b, global_epoch
-            )
-            val_metrics = self._validate(val_loader, global_epoch)
-            cosine_sched.step_epoch()
-
-            self._log_epoch(global_epoch, train_loss, val_metrics,
-                            optimizer_b, prefix="phase_b")
-
-            val_de  = val_metrics.get("delta_e", float("inf"))
-            is_best = val_de < self._best_val_delta_e
-            if is_best:
-                self._best_val_delta_e = val_de
-                self._best_epoch       = global_epoch
-
-            state = build_checkpoint_state(
-                self.model, optimizer_b,
-                epoch=global_epoch,
-                metrics={"val_delta_e": val_de, "train_loss": train_loss},
-            )
-            path = save_checkpoint(
-                state, self.checkpoint_dir,
-                filename=f"epoch_{global_epoch:04d}.pth",
-                is_best=is_best,
-            )
-            if is_best:
-                best_ckpt_path = str(
-                    Path(self.checkpoint_dir) / "best.pth"
-                )
-
-            if early_stop_b.step(val_de, global_epoch):
-                logger.info("Early stopping nella Fase 3B.")
-                break
-
-        self.tb.close()
-        logger.info(
-            f"Adaptation completata. "
-            f"Best epoch={self._best_epoch}, "
-            f"best ΔE={self._best_val_delta_e:.4f}"
-        )
-        return best_ckpt_path
-
-    # ── Epoch ─────────────────────────────────────────────────────────────────
-
-    def _train_epoch(
-        self,
-        loader: DataLoader,
-        optimizer: torch.optim.Optimizer,
-        epoch: int,
-    ) -> float:
-        """Esegue un'epoca di training. Restituisce la loss media."""
-        self.model.train()
-        total_loss = 0.0
-        n_batches  = 0
-
-        for batch in loader:
-            src = batch["src"].to(self.device)
-            tgt = batch["tgt"].to(self.device)
-
-            optimizer.zero_grad()
-
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                out  = self.model(src)
-                pred = out["pred"]
-                loss_dict = self.loss_fn(pred, tgt, src=src)
-                loss      = loss_dict["total"]
-
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.cfg.get("optimizer", {}).get("grad_clip", 1.0),
-            )
-            self.scaler.step(optimizer)
-            self.scaler.update()
-
-            total_loss += loss.item()
-            n_batches  += 1
-            self._global_step += 1
-
-            if self._global_step % 10 == 0:
-                self.tb.log_loss_breakdown(
-                    {k: v.item() for k, v in loss_dict.items()},
-                    self._global_step,
-                    prefix="adapt/",
-                )
-
-        return total_loss / max(n_batches, 1)
-
-    @torch.no_grad()
-    def _validate(
-        self,
-        loader: DataLoader,
-        epoch: int,
-    ) -> Dict[str, float]:
-        """Esegue la validazione. Restituisce dizionario di metriche."""
-        from losses.delta_e import DeltaELoss
-
-        self.model.eval()
-        l_de_fn   = DeltaELoss().to(self.device)
-        total_de  = 0.0
-        total_loss = 0.0
-        n_batches  = 0
-
-        for batch in loader:
-            src = batch["src"].to(self.device)
-            tgt = batch["tgt"].to(self.device)
-
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                out  = self.model(src)
-                pred = out["pred"]
-                loss_dict = self.loss_fn(pred, tgt)
-                de        = l_de_fn(pred, tgt)
-
-            total_loss += loss_dict["total"].item()
-            total_de   += de.item()
-            n_batches  += 1
-
-        n = max(n_batches, 1)
-        metrics = {
-            "loss":    total_loss / n,
-            "delta_e": total_de   / n,
-        }
-
-        # Log immagini di confronto (primo batch)
-        if loader.dataset and len(loader.dataset) > 0:
-            sample = loader.dataset[0]
-            src_t  = sample["src"].unsqueeze(0).to(self.device)
-            tgt_t  = sample["tgt"].unsqueeze(0).to(self.device)
-            out_t  = self.model(src_t)
-            pred_t = out_t["pred"]
-            self.tb.log_comparison(
-                src_t.cpu(), pred_t.cpu(), tgt_t.cpu(), epoch
-            )
-
-        return metrics
-
-    def _log_epoch(
-        self,
-        epoch: int,
-        train_loss: float,
-        val_metrics: Dict[str, float],
-        optimizer: torch.optim.Optimizer,
-        prefix: str = "",
-    ) -> None:
-        """Logga le metriche dell'epoca."""
-        val_de = val_metrics.get("delta_e", float("inf"))
-        logger.info(
-            f"Epoch {epoch} | train_loss={train_loss:.4f} | "
-            f"val_ΔE={val_de:.4f}"
-        )
-        self.tb.log_scalar(f"{prefix}/train_loss", train_loss, epoch)
-        self.tb.log_metrics(val_metrics, epoch, prefix=f"{prefix}/val_")
-        self.tb.log_lr(optimizer, epoch, prefix=f"{prefix}/")
+    metrics = {k: v / max(n_batches, 1) for k, v in accum.items()}
+    metrics["n_batches"] = n_batches
+    return metrics
