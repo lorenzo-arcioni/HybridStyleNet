@@ -159,7 +159,7 @@ def bilateral_slice(
     b = coeffs[:, 9:, :, :]                        # (B, 3, H, W)
 
     out = torch.einsum("bckhw,bkhw->bchw", A, img) + b
-    return out.clamp(-1.0, 2.0)   # range ampio ma finito
+    return out.clamp(0.0, 1.0) # range ampio ma finito
 
 # ---------------------------------------------------------------------------
 # GridNet
