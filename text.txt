@@ -2773,12 +2773,12 @@ class DeltaELoss(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        pred: torch.Tensor,   # (B, 3, H, W) sRGB [0,1]
-        tgt:  torch.Tensor,   # (B, 3, H, W) sRGB [0,1]
+        pred: torch.Tensor,
+        tgt:  torch.Tensor,
     ) -> torch.Tensor:
-        pred_lab = rgb_to_lab(pred)               # (B, 3, H, W)
-        tgt_lab  = rgb_to_lab(tgt)
-
+        # Forza fp32 — CIEDE2000 ha radici quadrate instabili in fp16
+        pred_lab = rgb_to_lab(pred.float().clamp(0, 1))
+        tgt_lab  = rgb_to_lab(tgt.float().clamp(0, 1))
         return self._delta_e_2000(pred_lab, tgt_lab).mean()
 
     # ------------------------------------------------------------------
@@ -2878,7 +2878,7 @@ class DeltaELoss(nn.Module):
         term_H = (dHp  / (kH * SH + eps)).pow(2)
         term_R = RT * (dCp / (kC * SC + eps)) * (dHp / (kH * SH + eps))
 
-        delta_e = (term_L + term_C + term_H + term_R + eps).sqrt()
+        delta_e = (term_L + term_C + term_H + term_R + eps).clamp(min=0).sqrt()
         return delta_e                            # (B, H, W)
 
 
@@ -3011,31 +3011,31 @@ class PerceptualLoss(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        pred:      torch.Tensor,              # (B, 3, H, W) sRGB [0,1]
-        tgt:       torch.Tensor,              # (B, 3, H, W) sRGB [0,1]
-        F_sem_pred: Optional[torch.Tensor] = None,  # (B, N, 384) pre-calcolato
-        F_sem_tgt:  Optional[torch.Tensor] = None,  # (B, N, 384) pre-calcolato
+        pred:      torch.Tensor,
+        tgt:       torch.Tensor,
+        F_sem_pred: Optional[torch.Tensor] = None,
+        F_sem_tgt:  Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Se F_sem_pred e F_sem_tgt sono forniti, li riusa direttamente
-        (zero costo aggiuntivo). Altrimenti esegue DINOv2 su entrambi.
-        """
         if F_sem_pred is not None and F_sem_tgt is not None:
-            return F.mse_loss(F_sem_pred, F_sem_tgt)
+            return F.mse_loss(F_sem_pred.float(), F_sem_tgt.float())
 
         if self.backbone is None:
             raise ValueError(
                 "PerceptualLoss richiede un backbone DINOv2 o feature pre-calcolate."
             )
 
+        # Forza fp32 e clamp [0,1] prima di passare a DINOv2
+        pred_f = pred.float().clamp(0, 1)
+        tgt_f  = tgt.float().clamp(0, 1)
+
         with torch.no_grad():
-            out_pred = self.backbone.forward_features(pred)
-            out_tgt  = self.backbone.forward_features(tgt)
+            out_pred = self.backbone.forward_features(pred_f)
+            out_tgt  = self.backbone.forward_features(tgt_f)
 
         f_pred = out_pred["x_norm_patchtokens"] if isinstance(out_pred, dict) else out_pred[:, 1:]
         f_tgt  = out_tgt["x_norm_patchtokens"]  if isinstance(out_tgt,  dict) else out_tgt[:, 1:]
 
-        return F.mse_loss(f_pred, f_tgt)
+        return F.mse_loss(f_pred.float(), f_tgt.float())
 
 
 # ---------------------------------------------------------------------------

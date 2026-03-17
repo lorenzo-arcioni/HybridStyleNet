@@ -54,10 +54,11 @@ class DeltaELoss(nn.Module):
         pred: torch.Tensor,
         tgt:  torch.Tensor,
     ) -> torch.Tensor:
-        # Forza fp32 — CIEDE2000 ha radici quadrate instabili in fp16
         pred_lab = rgb_to_lab(pred.float().clamp(0, 1))
         tgt_lab  = rgb_to_lab(tgt.float().clamp(0, 1))
-        return self._delta_e_2000(pred_lab, tgt_lab).mean()
+        de = self._delta_e_2000(pred_lab, tgt_lab)
+        # Clamp il risultato per evitare spike
+        return de.clamp(max=50.0).mean()
 
     # ------------------------------------------------------------------
     def _delta_e_2000(
