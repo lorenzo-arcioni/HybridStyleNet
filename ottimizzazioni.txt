@@ -1,5 +1,5 @@
 1) puoi usare MobileNetV3-Small
-2)Procedi con Reptile
+2) Procedi con Reptile
 3) usare un subset fisso di K=20
 4) Non fare nulla
 5) usare VGG16 invece di VGG19; usare solo 2 layer invece di 4

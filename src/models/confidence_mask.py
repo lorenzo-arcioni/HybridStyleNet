@@ -74,14 +74,13 @@ class MaskNet(nn.Module):
 
     # ------------------------------------------------------------------
     def _init_weights(self) -> None:
-        """
-        Inizializzazione che produce α ≈ 0.5 all'inizio del training.
-        Il bias di conv2 a 0 → sigmoid(0) = 0.5.
-        """
+        # conv1: inizializzazione standard
         nn.init.kaiming_normal_(self.conv1.weight, nonlinearity="relu")
         nn.init.zeros_(self.conv1.bias)
-        nn.init.xavier_uniform_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)             # sigmoid(0) = 0.5
+        # conv2: pesi e bias a zero → output = 0 → sigmoid(0) = 0.5 esatto,
+        # indipendente dalla distribuzione dell'output di conv1
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
 
     # ------------------------------------------------------------------
     def forward(

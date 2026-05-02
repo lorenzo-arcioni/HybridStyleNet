@@ -157,7 +157,7 @@ class DeltaELoss(nn.Module):
         term_H = (dHp  / (kH * SH + eps)).pow(2)
         term_R = RT * (dCp / (kC * SC + eps)) * (dHp / (kH * SH + eps))
 
-        delta_e = (term_L + term_C + term_H + term_R + eps).clamp(min=0).sqrt()
+        delta_e = (term_L + term_C + term_H + term_R).clamp(min=eps * 100).sqrt()
         return delta_e                            # (B, H, W)
 
 

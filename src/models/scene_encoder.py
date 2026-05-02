@@ -100,8 +100,8 @@ class ColorHistogram(nn.Module):
             weights = torch.exp(-diff.pow(2) / (2 * sigma.pow(2)))  # (B, H*W, n_bins)
 
             # normalizza per pixel poi somma sui pixel
-            w_norm  = weights / (weights.sum(-1, keepdim=True) + 1e-8)
-            hist    = w_norm.mean(dim=1)           # (B, n_bins)
+            hist_unnorm = weights.sum(dim=1)          # (B, n_bins) — somma sui pixel
+            hist        = hist_unnorm / (hist_unnorm.sum(dim=-1, keepdim=True) + 1e-8)
             parts.append(hist)
 
         return torch.cat(parts, dim=1)             # (B, 192)
@@ -281,18 +281,16 @@ class SceneEncoder(nn.Module):
         new_H = (H // P) * P
         new_W = (W // P) * P
 
-        if new_H != H or new_W != W:
-            img = F.interpolate(
-                img, size=(new_H, new_W),
-                mode="bilinear", align_corners=False, antialias=True,
-            )
-
         n_h = new_H // P
         n_w = new_W // P
 
-        img_norm = self._normalise_for_dino(img)
-
         with torch.no_grad():
+            if new_H != H or new_W != W:
+                img = F.interpolate(
+                    img, size=(new_H, new_W),
+                    mode="bilinear", align_corners=False, antialias=True,
+                )
+            img_norm = self._normalise_for_dino(img)
             out = self.backbone.forward_features(img_norm)
 
         if isinstance(out, dict) and "x_norm_patchtokens" in out:

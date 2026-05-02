@@ -118,48 +118,39 @@ class SemanticGuide(nn.Module):
 # bilateral_slice  (differenziabile)
 # ---------------------------------------------------------------------------
 
-def bilateral_slice(
-    grid:  torch.Tensor,    # (B, n_coeff, s_spatial, s_spatial, s_lum)
-    img:   torch.Tensor,    # (B, 3, H, W)
-    guide: torch.Tensor,    # (B, H, W) ∈ [0, 1]
-) -> torch.Tensor:
+def bilateral_slice(grid, img, guide):
     B, n_coeff, s_sp, _, s_lum = grid.shape
     _, _, H, W = img.shape
 
-    # Coordinate normalizzate in [-1, 1]
-    y_coords = torch.linspace(-1, 1, H, device=img.device)
-    x_coords = torch.linspace(-1, 1, W, device=img.device)
-    yy, xx   = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    # guide può arrivare come (H, W), (1, H, W) o (B, H, W) — normalizza sempre
+    if guide.dim() == 2:
+        guide = guide.unsqueeze(0)          # → (1, H, W)
+    if guide.shape[0] == 1 and B > 1:
+        guide = guide.expand(B, -1, -1)     # → (B, H, W)
 
-    zz = guide * 2.0 - 1.0                       # (B, H, W)
+    y = torch.linspace(-1, 1, H, device=img.device)
+    x = torch.linspace(-1, 1, W, device=img.device)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")   # (H, W)
+    zz = guide * 2.0 - 1.0                          # (B, H, W)
 
-    xx_exp = xx.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
-    yy_exp = yy.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
+    # Espandi le coordinate spaziali alla batch size
+    xx_e = xx.unsqueeze(0).expand(B, -1, -1)        # (B, H, W)
+    yy_e = yy.unsqueeze(0).expand(B, -1, -1)        # (B, H, W)
 
-    # sample_coords: (B, H, W, 3)
-    sample_coords = torch.stack([xx_exp, yy_exp, zz], dim=-1)
-    # Per grid_sample 5D: (B, 1, H, W, 3)
-    sample_coords_5d = sample_coords.unsqueeze(1)
+    grid_5d = grid.permute(0, 1, 4, 2, 3)           # (B, n_coeff, s_lum, s_sp, s_sp)
 
-    # grid_5d: (B, n_coeff, s_lum, s_sp, s_sp)
-    grid_5d = grid.permute(0, 1, 4, 2, 3)
+    coords = torch.stack([xx_e, yy_e, zz], dim=-1)  # (B, H, W, 3) ← ora ok
+    coords_5d = coords.unsqueeze(3)                  # (B, H, W, 1, 3)
 
-    # Interpola ogni canale separatamente per evitare il problema del batch
-    # grid_sample 5D: input (B, C, D, H, W), grid (B, 1, H, W, 3)
     coeffs = F.grid_sample(
-        grid_5d,
-        sample_coords_5d.expand(-1, 1, -1, -1, -1),
-        mode="bilinear", align_corners=True, padding_mode="border",
-    )
-    # coeffs: (B, n_coeff, 1, H, W) → (B, n_coeff, H, W)
-    coeffs = coeffs.squeeze(2)
+        grid_5d, coords_5d,
+        mode="bilinear", align_corners=True, padding_mode="border"
+    )  # (B, n_coeff, H, W, 1)
+    coeffs = coeffs.squeeze(-1)                      # (B, n_coeff, H, W)
 
-    # Applica trasformazione affine 3x4
-    A = coeffs[:, :9, :, :].reshape(B, 3, 3, H, W)
-    b = coeffs[:, 9:, :, :]                        # (B, 3, H, W)
-
-    out = torch.einsum("bckhw,bkhw->bchw", A, img) + b
-    return out.clamp(0.0, 1.0) # range ampio ma finito
+    A = coeffs[:, :9].reshape(B, 3, 3, H, W)
+    b = coeffs[:, 9:]                                # (B, 3, H, W)
+    return (torch.einsum("bckhw,bkhw->bchw", A, img) + b).clamp(0, 1)
 
 # ---------------------------------------------------------------------------
 # GridNet
@@ -248,12 +239,17 @@ class GridNet(nn.Module):
         last_global = self.global_branch[-1]
         nn.init.zeros_(last_global.weight)
         total_global = self.global_s * self.global_s * self.global_l
-        last_global.bias.data = identity.repeat(total_global)
+        # repeat_interleave: ogni elemento di identity viene ripetuto total_global
+        # volte consecutive → layout [n_affine * total_global] coerente col reshape
+        # (B, n_affine, global_s, global_s, global_l)
+        last_global.bias.data = identity.repeat_interleave(total_global)
 
         # Local branch — local_conv
         nn.init.zeros_(self.local_conv.weight)
-        total_local = self.local_l
-        self.local_conv.bias.data = identity.repeat(total_local)
+        identity_expanded = identity.unsqueeze(1).expand(
+            self.n_affine, self.local_l
+        ).reshape(-1)   # (96,) interleaved correttamente
+        self.local_conv.bias.data = identity_expanded
 
     # ------------------------------------------------------------------
     def forward(

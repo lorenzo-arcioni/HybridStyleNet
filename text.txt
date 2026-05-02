@@ -1,6 +1,5 @@
 
 
-
 === ./src/inference/batch_grade.py ===
 """
 batch_grade.py
@@ -2776,10 +2775,11 @@ class DeltaELoss(nn.Module):
         pred: torch.Tensor,
         tgt:  torch.Tensor,
     ) -> torch.Tensor:
-        # Forza fp32 — CIEDE2000 ha radici quadrate instabili in fp16
         pred_lab = rgb_to_lab(pred.float().clamp(0, 1))
         tgt_lab  = rgb_to_lab(tgt.float().clamp(0, 1))
-        return self._delta_e_2000(pred_lab, tgt_lab).mean()
+        de = self._delta_e_2000(pred_lab, tgt_lab)
+        # Clamp il risultato per evitare spike
+        return de.clamp(max=50.0).mean()
 
     # ------------------------------------------------------------------
     def _delta_e_2000(
@@ -4730,14 +4730,13 @@ class MaskNet(nn.Module):
 
     # ------------------------------------------------------------------
     def _init_weights(self) -> None:
-        """
-        Inizializzazione che produce α ≈ 0.5 all'inizio del training.
-        Il bias di conv2 a 0 → sigmoid(0) = 0.5.
-        """
+        # conv1: inizializzazione standard
         nn.init.kaiming_normal_(self.conv1.weight, nonlinearity="relu")
         nn.init.zeros_(self.conv1.bias)
-        nn.init.xavier_uniform_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)             # sigmoid(0) = 0.5
+        # conv2: pesi e bias a zero → output = 0 → sigmoid(0) = 0.5 esatto,
+        # indipendente dalla distribuzione dell'output di conv1
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
 
     # ------------------------------------------------------------------
     def forward(
@@ -4983,48 +4982,39 @@ class SemanticGuide(nn.Module):
 # bilateral_slice  (differenziabile)
 # ---------------------------------------------------------------------------
 
-def bilateral_slice(
-    grid:  torch.Tensor,    # (B, n_coeff, s_spatial, s_spatial, s_lum)
-    img:   torch.Tensor,    # (B, 3, H, W)
-    guide: torch.Tensor,    # (B, H, W) ∈ [0, 1]
-) -> torch.Tensor:
+def bilateral_slice(grid, img, guide):
     B, n_coeff, s_sp, _, s_lum = grid.shape
     _, _, H, W = img.shape
 
-    # Coordinate normalizzate in [-1, 1]
-    y_coords = torch.linspace(-1, 1, H, device=img.device)
-    x_coords = torch.linspace(-1, 1, W, device=img.device)
-    yy, xx   = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    # guide può arrivare come (H, W), (1, H, W) o (B, H, W) — normalizza sempre
+    if guide.dim() == 2:
+        guide = guide.unsqueeze(0)          # → (1, H, W)
+    if guide.shape[0] == 1 and B > 1:
+        guide = guide.expand(B, -1, -1)     # → (B, H, W)
 
-    zz = guide * 2.0 - 1.0                       # (B, H, W)
+    y = torch.linspace(-1, 1, H, device=img.device)
+    x = torch.linspace(-1, 1, W, device=img.device)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")   # (H, W)
+    zz = guide * 2.0 - 1.0                          # (B, H, W)
 
-    xx_exp = xx.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
-    yy_exp = yy.unsqueeze(0).expand(B, -1, -1)    # (B, H, W)
+    # Espandi le coordinate spaziali alla batch size
+    xx_e = xx.unsqueeze(0).expand(B, -1, -1)        # (B, H, W)
+    yy_e = yy.unsqueeze(0).expand(B, -1, -1)        # (B, H, W)
 
-    # sample_coords: (B, H, W, 3)
-    sample_coords = torch.stack([xx_exp, yy_exp, zz], dim=-1)
-    # Per grid_sample 5D: (B, 1, H, W, 3)
-    sample_coords_5d = sample_coords.unsqueeze(1)
+    grid_5d = grid.permute(0, 1, 4, 2, 3)           # (B, n_coeff, s_lum, s_sp, s_sp)
 
-    # grid_5d: (B, n_coeff, s_lum, s_sp, s_sp)
-    grid_5d = grid.permute(0, 1, 4, 2, 3)
+    coords = torch.stack([xx_e, yy_e, zz], dim=-1)  # (B, H, W, 3) ← ora ok
+    coords_5d = coords.unsqueeze(3)                  # (B, H, W, 1, 3)
 
-    # Interpola ogni canale separatamente per evitare il problema del batch
-    # grid_sample 5D: input (B, C, D, H, W), grid (B, 1, H, W, 3)
     coeffs = F.grid_sample(
-        grid_5d,
-        sample_coords_5d.expand(-1, 1, -1, -1, -1),
-        mode="bilinear", align_corners=True, padding_mode="border",
-    )
-    # coeffs: (B, n_coeff, 1, H, W) → (B, n_coeff, H, W)
-    coeffs = coeffs.squeeze(2)
+        grid_5d, coords_5d,
+        mode="bilinear", align_corners=True, padding_mode="border"
+    )  # (B, n_coeff, H, W, 1)
+    coeffs = coeffs.squeeze(-1)                      # (B, n_coeff, H, W)
 
-    # Applica trasformazione affine 3x4
-    A = coeffs[:, :9, :, :].reshape(B, 3, 3, H, W)
-    b = coeffs[:, 9:, :, :]                        # (B, 3, H, W)
-
-    out = torch.einsum("bckhw,bkhw->bchw", A, img) + b
-    return out
+    A = coeffs[:, :9].reshape(B, 3, 3, H, W)
+    b = coeffs[:, 9:]                                # (B, 3, H, W)
+    return (torch.einsum("bckhw,bkhw->bchw", A, img) + b).clamp(0, 1)
 
 # ---------------------------------------------------------------------------
 # GridNet
@@ -5113,12 +5103,17 @@ class GridNet(nn.Module):
         last_global = self.global_branch[-1]
         nn.init.zeros_(last_global.weight)
         total_global = self.global_s * self.global_s * self.global_l
-        last_global.bias.data = identity.repeat(total_global)
+        # repeat_interleave: ogni elemento di identity viene ripetuto total_global
+        # volte consecutive → layout [n_affine * total_global] coerente col reshape
+        # (B, n_affine, global_s, global_s, global_l)
+        last_global.bias.data = identity.repeat_interleave(total_global)
 
         # Local branch — local_conv
         nn.init.zeros_(self.local_conv.weight)
-        total_local = self.local_l
-        self.local_conv.bias.data = identity.repeat(total_local)
+        identity_expanded = identity.unsqueeze(1).expand(
+            self.n_affine, self.local_l
+        ).reshape(-1)   # (96,) interleaved correttamente
+        self.local_conv.bias.data = identity_expanded
 
     # ------------------------------------------------------------------
     def forward(
@@ -5361,8 +5356,8 @@ class ColorHistogram(nn.Module):
             weights = torch.exp(-diff.pow(2) / (2 * sigma.pow(2)))  # (B, H*W, n_bins)
 
             # normalizza per pixel poi somma sui pixel
-            w_norm  = weights / (weights.sum(-1, keepdim=True) + 1e-8)
-            hist    = w_norm.mean(dim=1)           # (B, n_bins)
+            hist_unnorm = weights.sum(dim=1)          # (B, n_bins) — somma sui pixel
+            hist        = hist_unnorm / (hist_unnorm.sum(dim=-1, keepdim=True) + 1e-8)
             parts.append(hist)
 
         return torch.cat(parts, dim=1)             # (B, 192)
@@ -5542,18 +5537,16 @@ class SceneEncoder(nn.Module):
         new_H = (H // P) * P
         new_W = (W // P) * P
 
-        if new_H != H or new_W != W:
-            img = F.interpolate(
-                img, size=(new_H, new_W),
-                mode="bilinear", align_corners=False, antialias=True,
-            )
-
         n_h = new_H // P
         n_w = new_W // P
 
-        img_norm = self._normalise_for_dino(img)
-
         with torch.no_grad():
+            if new_H != H or new_W != W:
+                img = F.interpolate(
+                    img, size=(new_H, new_W),
+                    mode="bilinear", align_corners=False, antialias=True,
+                )
+            img_norm = self._normalise_for_dino(img)
             out = self.backbone.forward_features(img_norm)
 
         if isinstance(out, dict) and "x_norm_patchtokens" in out:
